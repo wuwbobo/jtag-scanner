@@ -1,0 +1,18 @@
+[package]
+name = "jtag-scanner"
+version = "0.1.0"
+edition = "2024"
+authors = [
+    "wuwbobo <wuwbobo@outlook.com>",
+]
+description = "A JTAG boundary scanning module"
+repository = "https://codeberg.org/wuwbobo/jtag-scanner"
+categories = ["embedded", "hardware-support", "development-tools::debugging"]
+keywords = ["embedded", "JTAG", "BSDL"]
+license = "MIT"
+
+[dependencies]
+bitvec = "1.1.1"
+bsdl = "0.1.1"
+jtag_idcode = { version = "0.1.1", features = ["jep106"] }
+jtag-taps = { git = "https://github.com/wuwbobo/jtag-taps" }
