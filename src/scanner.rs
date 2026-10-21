@@ -1,18 +1,17 @@
 use bitvec::{order::Lsb0, vec::BitVec};
-use jtag_taps::{
-    cable::Cable,
-    statemachine::{
-        JtagSM, JtagState,
+
+use crate::{
+    PinIdIter,
+    jtag::{
+        JtagInterface, JtagState,
         Register::{Data, Instruction},
     },
+    types::{PinId, PinState, TapCmd, TapInfo, TapState},
 };
 
-use crate::types::{PinId, PinState, TapCmd, TapInfo, TapState};
-use crate::{PinIdIter, jtag::JtagSMExt};
-
 /// Basic structure for doing boundary scanning. Expects a fixed chain of devices.
-pub struct PinScanner<T> {
-    sm: JtagSM<T>,
+pub struct PinScanner<T: JtagInterface> {
+    sm: T,
     tap_infos: Vec<TapInfo>,
     tap_cmds: Vec<TapCmd>,
     dr_in: BitVec<u8, Lsb0>,
@@ -20,29 +19,25 @@ pub struct PinScanner<T> {
     extest_keep_present: bool,
 }
 
-impl<T, U> PinScanner<T>
-where
-    T: std::ops::DerefMut<Target = U>,
-    U: Cable + ?Sized,
-{
+impl<T: JtagInterface> PinScanner<T> {
     pub(crate) fn build(
-        mut sm: JtagSM<T>,
+        mut sm: T,
         tap_infos: Vec<TapInfo>,
         ir_len: usize,
         extest_keep_present: bool,
-    ) -> Self {
+    ) -> Result<Self, String> {
         // make sure all TAPs are in bypass mode
-        sm.write_repeated(Instruction, 1, ir_len + 1);
-        sm.change_mode(JtagState::UpdateIR);
+        sm.write_repeated(Instruction, 1, ir_len + 1)?;
+        sm.switch_mode(JtagState::UpdateIR)?;
         let cnt_taps = tap_infos.len();
-        Self {
+        Ok(Self {
             sm,
             tap_infos,
             tap_cmds: vec![TapCmd::Bypass; cnt_taps],
             dr_in: BitVec::repeat(false, cnt_taps),
             dr_out: BitVec::repeat(false, cnt_taps),
             extest_keep_present,
-        }
+        })
     }
 
     /// Count of TAPs on the chain.
@@ -94,7 +89,7 @@ where
         match (self.get_tap_state(i)?, new_state) {
             (TapState::Bypass, TapState::Sample) => {
                 // check IDCODEs again
-                self.command(i, TapCmd::Idcode);
+                self.command(i, TapCmd::Idcode)?;
                 let raw_idcodes = self.split_dr_data(&self.dr_in);
                 let raw_idcode = raw_idcodes[i].as_raw_slice();
                 let idcode = (raw_idcode[0] as u32)
@@ -102,21 +97,21 @@ where
                     | ((raw_idcode[2] as u32) << 16)
                     | ((raw_idcode[3] as u32) << 24);
                 if !self.tap_infos[i].matches_idcode(idcode) {
-                    self.command(i, TapCmd::Bypass);
+                    self.command(i, TapCmd::Bypass)?;
                     return Err("IDCODE check failed".into());
                 }
                 if !self.tap_cmds.contains(&TapCmd::Extest) {
                     // check DR len
-                    self.command(i, TapCmd::Sample);
-                    if self.sm.measure_dr_len() != self.dr_in.len() {
-                        self.command(i, TapCmd::Bypass);
+                    self.command(i, TapCmd::Sample)?;
+                    if self.sm.measure_dr_len()? != self.dr_in.len() {
+                        self.command(i, TapCmd::Bypass)?;
                         return Err("IDCODE check failed".into());
                     }
                 }
             }
             (TapState::Sample, TapState::Extest) => {
                 // do PRELOAD first
-                self.command(i, TapCmd::Preload);
+                self.command(i, TapCmd::Preload)?;
                 let mut splited_dr_out = self.split_dr_data(&self.dr_out);
                 let preload_values = if self.extest_keep_present {
                     // try to preserve previous output and output enable status
@@ -126,11 +121,11 @@ where
                 };
                 splited_dr_out[i].copy_from_bitslice(preload_values);
                 self.dr_out = self.merge_dr_data(&mut splited_dr_out);
-                self.update();
+                self.update()?;
             }
             _ => (),
         }
-        self.command(i, new_state.into());
+        self.command(i, new_state.into())?;
         Ok(())
     }
 
@@ -226,25 +221,44 @@ where
     /// Applies [Self::set_pin_state] calls since last [Self::update] and refreshes
     /// the capture buffer for later [Self::get_pin_state] calls with the values
     /// before setting new pin states.
-    pub fn update(&mut self) {
-        self.sm.change_mode(JtagState::CaptureDR);
-        self.sm.read_write_bits(Data, &mut self.dr_in, &self.dr_out);
-        self.sm.change_mode(JtagState::UpdateDR);
+    pub fn update(&mut self) -> Result<(), String> {
+        self.sm.switch_mode(JtagState::CaptureDR)?;
+        self.sm
+            .read_write_bits(Data, &mut self.dr_in, &self.dr_out)?;
+        self.sm.switch_mode(JtagState::UpdateDR)?;
+        Ok(())
     }
 
     /// Applies [Self::set_pin_state] calls and then does [Self::update], so that
     /// later [Self::get_pin_state] calls will be influenced by the newly set values.
     /// This makes no sense if no TAP is in EXTEST mode.
-    pub fn write_update(&mut self) {
-        self.sm.write_bits(Data, &self.dr_out);
-        self.update();
+    pub fn write_update(&mut self) -> Result<(), String> {
+        // apply written bits.
+        self.sm.write_bits(Data, &self.dr_out)?;
+        self.sm.switch_mode(JtagState::UpdateDR)?;
+        // this is just for reading.
+        self.sm
+            .read_write_bits(Data, &mut self.dr_in, &self.dr_out)?;
+        Ok(())
+    }
+
+    /// Switches all TAPs to BYPASS state.
+    pub fn release(&mut self) -> Result<(), String> {
+        let ir_len: usize = self.tap_infos().iter().map(|t| t.ir_len()).sum();
+        self.sm.write_repeated(Instruction, 1, ir_len + 1)?;
+        self.sm.switch_mode(JtagState::UpdateIR)?;
+        self.tap_cmds = vec![TapCmd::Bypass; self.tap_count()];
+        self.dr_in.truncate(self.tap_count());
+        self.dr_out.truncate(self.tap_count());
+        self.sm.mode_reset()?;
+        Ok(())
     }
 
     /// Switches the IR command for the TAP of index `i`.
     ///
     /// XXX: currently `dr_in` and `dr_out` are simply being resized here
     /// when switching to a DR of different length, extended with 0s if needed.
-    fn command(&mut self, i: usize, tap_cmd: TapCmd) {
+    fn command(&mut self, i: usize, tap_cmd: TapCmd) -> Result<(), String> {
         let old_dr_len = self.tap_infos[i].dr_len(self.tap_cmds[i]);
         let new_dr_len = self.tap_infos[i].dr_len(tap_cmd);
         if old_dr_len != new_dr_len {
@@ -262,9 +276,10 @@ where
         for (i, &cmd) in self.tap_cmds.iter().enumerate().rev() {
             self.tap_infos[i].push_opcode(cmd, &mut ir_data);
         }
-        self.sm.write_bits(Instruction, &ir_data);
-        self.sm.change_mode(JtagState::UpdateIR);
-        self.update();
+        self.sm.write_bits(Instruction, &ir_data)?;
+        self.sm.switch_mode(JtagState::UpdateIR)?;
+        self.update()?;
+        Ok(())
     }
 
     fn split_dr_data(&self, dr: &BitVec<u8, Lsb0>) -> Vec<BitVec<u8, Lsb0>> {
@@ -306,5 +321,13 @@ where
             .map(|(i, tap)| tap.dr_len(self.tap_cmds[i]))
             .sum::<usize>()
             + i_cell
+    }
+}
+
+impl<T: JtagInterface> Drop for PinScanner<T> {
+    fn drop(&mut self) {
+        let _ = self
+            .release()
+            .inspect_err(|e| eprintln!("failed to set taps to bypass mode: {e}"));
     }
 }

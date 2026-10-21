@@ -1,34 +1,32 @@
 use std::{cell::OnceCell, path::Path, sync::Arc};
 
 use bitvec::vec::BitVec;
-use jtag_taps::{
-    cable::Cable,
-    statemachine::{
-        JtagSM, JtagState,
+
+use crate::{
+    jtag::{
+        JtagInterface, JtagState,
         Register::{Data, Instruction},
     },
+    scanner::PinScanner,
+    types::TapInfo,
 };
-
-use crate::{jtag::JtagSMExt, scanner::PinScanner, types::TapInfo};
 
 /// The only way to build [PinScanner]; detects IDCODEs of devices on the chain,
 /// and scan for BSDL files.
-pub struct PinScannerBuilder<T> {
-    sm: JtagSM<T>,
+pub struct PinScannerBuilder<T: JtagInterface> {
+    sm: T,
     idcodes: OnceCell<Vec<u32>>,
     tap_infos: Vec<TapInfo>,
     extest_keep_present: bool,
 }
 
-impl<T, U> PinScannerBuilder<T>
-where
-    T: std::ops::DerefMut<Target = U>,
-    U: Cable + ?Sized,
-{
-    /// All configuration for the `JtagSM` needs to be done before wrapping
+impl<T: JtagInterface> PinScannerBuilder<T> {
+    /// All configuration for the `sm` needs to be done before wrapping
     /// it with the builder.
-    pub fn new(mut sm: JtagSM<T>) -> Self {
-        sm.mode_reset();
+    pub fn new(mut sm: T) -> Self {
+        let _ = sm
+            .mode_reset()
+            .inspect_err(|e| eprintln!("sm.mode_reset() failed: {e}"));
         Self {
             sm,
             idcodes: OnceCell::new(),
@@ -136,7 +134,7 @@ where
         }
 
         // verify IR length
-        let ir_len = self.sm.measure_ir_len();
+        let ir_len = self.sm.measure_ir_len()?;
         let info_ir_len: usize = self.tap_infos.iter().map(|info| info.ir_len()).sum();
         if info_ir_len != ir_len {
             return Err(format!(
@@ -145,12 +143,7 @@ where
             ));
         }
 
-        Ok(PinScanner::build(
-            self.sm,
-            self.tap_infos,
-            ir_len,
-            self.extest_keep_present,
-        ))
+        PinScanner::build(self.sm, self.tap_infos, ir_len, self.extest_keep_present)
     }
 
     /// Gets IDCODEs of all TAPs on the chain, from TDI to TDO.
@@ -159,23 +152,23 @@ where
             return Ok(idcodes.clone());
         }
 
-        let dev_cnt = self.count_devices();
+        let dev_cnt = self.count_devices()?;
 
-        self.sm.mode_reset(); // test logic reset
-        let dr_len = self.sm.measure_dr_len();
+        self.sm.mode_reset()?; // test logic reset
+        let dr_len = self.sm.measure_dr_len()?;
         if dr_len != dev_cnt * 32 {
             return Err(format!(
                 "Found device without IDCODE register, dr_len: {dr_len}"
             ));
         }
 
-        self.sm.mode_reset(); // test logic reset
+        self.sm.mode_reset()?; // test logic reset
 
-        self.sm.change_mode(JtagState::CaptureDR);
+        self.sm.switch_mode(JtagState::CaptureDR)?;
         // reads IDCODEs starting from the last device on the chain
         let mut raw_idcodes = BitVec::repeat(false, 32 * dev_cnt);
-        self.sm.read_bits(Data, &mut raw_idcodes);
-        self.sm.mode_reset(); // test logic reset
+        self.sm.read_bits(Data, &mut raw_idcodes)?;
+        self.sm.mode_reset()?; // test logic reset
 
         let mut idcodes = Vec::new();
         for raw_idcode in raw_idcodes.as_raw_slice().chunks(4) {
@@ -191,12 +184,12 @@ where
         Ok(idcodes)
     }
 
-    fn count_devices(&mut self) -> usize {
-        self.sm.mode_reset(); // test logic reset
+    fn count_devices(&mut self) -> Result<usize, String> {
+        self.sm.mode_reset()?; // test logic reset
 
         // make sure all TAPs are in bypass mode
-        self.sm.write_repeated(Instruction, 1, 1024);
-        self.sm.change_mode(JtagState::UpdateIR);
+        self.sm.write_repeated(Instruction, 1, 1024)?;
+        self.sm.switch_mode(JtagState::UpdateIR)?;
 
         self.sm.measure_dr_len()
     }

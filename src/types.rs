@@ -118,8 +118,8 @@ impl From<TapState> for TapCmd {
     }
 }
 
-/// Unique pin identifier associated with a [PinScanner] instance.
-/// This is not intended to be persistent or serializable.
+/// Unique pin identifier associated with a [PinScanner](crate::PinScanner)
+/// instance. This is not intended to be persistent or serializable.
 #[derive(Debug, Clone)]
 pub struct PinId {
     i_tap: usize,
@@ -241,7 +241,8 @@ impl PinId {
     }
 }
 
-/// Iterates through all [PinId]s for a TAP in the chain handled by [PinScanner].
+/// Iterates through all [PinId]s for a TAP in the chain handled by
+/// [PinScanner](crate::PinScanner).
 #[derive(Debug)]
 pub struct PinIdIter {
     i_tap: usize,

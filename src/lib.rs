@@ -1,5 +1,6 @@
+pub mod jtag;
+
 mod builder;
-mod jtag;
 mod scanner;
 mod types;
 
