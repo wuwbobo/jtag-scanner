@@ -132,7 +132,7 @@ pub trait JtagInterface {
 // `change_mode(UpdateDR)` is called right after that. So this is a problematic usage;
 // `pause_after: false` is just for multiple writes, and the last write before changing mode to
 // UpdateDR should have `pause_after: true`, to make the last bit of data shift by the Exit1DR
-// internally. So, `read_bits` and `read_write_bits` sets `pause_after` to true internally.
+// internally. So, `write_bits` and `read_write_bits` sets `pause_after` to true internally.
 //
 // The name `tdo` is used throughout `jtag_taps` cable implementations, referring to the host
 // output line, which is actually the TDI signal of the device.
@@ -144,6 +144,7 @@ where
 {
     fn switch_mode(&mut self, new_state: JtagState) -> Result<(), String> {
         self.change_mode(new_state);
+        self.cable.flush();
         Ok(())
     }
 
