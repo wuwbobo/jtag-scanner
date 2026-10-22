@@ -189,7 +189,7 @@ impl<T: JtagInterface> PinScannerBuilder<T> {
 
         // make sure all TAPs are in bypass mode
         self.sm.write_repeated(Instruction, 1, 1024)?;
-        self.sm.switch_mode(JtagState::UpdateIR)?;
+        self.sm.switch_mode(JtagState::Idle)?;
 
         self.sm.measure_dr_len()
     }

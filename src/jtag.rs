@@ -16,13 +16,16 @@ pub use jtag_taps::statemachine::{JtagState, Register};
 
 /// JTAG state machine interface.
 ///
-/// General notes for using the read/write functions:
-/// - The length of any bit vector passed should match the length of
-///   the current IR/DR chain of all TAPs.
+/// General notes for using `read_bits`, `write_bits`, `read_write_bits`:
+/// - The length of any bit vector passed to them should match the length
+///   of the current IR/DR chain of all TAPs.
 /// - These functions all make sure the state is in ShiftIR or ShiftDR
 ///   before actually shifting data.
+/// - These functions all make sure to finish the cable transfer instead
+///   of just queueing the operations.
 pub trait JtagInterface {
     /// Changes the mode of the state machine through the shortest path.
+    /// Always flushes the command; not for queued operations.
     ///
     /// TDI line is held high while clocking out TMS bits.
     fn switch_mode(&mut self, new_state: JtagState) -> Result<(), String>;
@@ -64,7 +67,14 @@ pub trait JtagInterface {
         one_or_zero: u8,
         bits: usize,
     ) -> Result<(), String> {
-        let data = BitVec::repeat(one_or_zero > 0, bits);
+        // limits the length of each transfer to 512 bits to avoid the limits
+        // in some `jtag_taps` cable implementations.
+        let (cnt_blocks, cnt_rem) = (bits / 512, bits % 512);
+        for _ in 0..cnt_blocks {
+            let data = BitVec::repeat(one_or_zero > 0, 512);
+            self.write_bits(reg, &data)?;
+        }
+        let data = BitVec::repeat(one_or_zero > 0, cnt_rem);
         self.write_bits(reg, &data)
     }
 
@@ -154,6 +164,7 @@ where
         }
         let bits = get_aligned(bits);
         self.write_reg(reg, bits.as_raw_slice(), last_byte_bits(&bits), true);
+        self.cable.flush();
         Ok(())
     }
 

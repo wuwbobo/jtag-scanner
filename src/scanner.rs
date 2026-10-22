@@ -28,7 +28,7 @@ impl<T: JtagInterface> PinScanner<T> {
     ) -> Result<Self, String> {
         // make sure all TAPs are in bypass mode
         sm.write_repeated(Instruction, 1, ir_len + 1)?;
-        sm.switch_mode(JtagState::UpdateIR)?;
+        sm.switch_mode(JtagState::Idle)?;
         let cnt_taps = tap_infos.len();
         Ok(Self {
             sm,
@@ -225,7 +225,7 @@ impl<T: JtagInterface> PinScanner<T> {
         self.sm.switch_mode(JtagState::CaptureDR)?;
         self.sm
             .read_write_bits(Data, &mut self.dr_in, &self.dr_out)?;
-        self.sm.switch_mode(JtagState::UpdateDR)?;
+        self.sm.switch_mode(JtagState::Idle)?;
         Ok(())
     }
 
@@ -235,7 +235,7 @@ impl<T: JtagInterface> PinScanner<T> {
     pub fn write_update(&mut self) -> Result<(), String> {
         // apply written bits.
         self.sm.write_bits(Data, &self.dr_out)?;
-        self.sm.switch_mode(JtagState::UpdateDR)?;
+        self.sm.switch_mode(JtagState::Idle)?;
         // this is just for reading.
         self.sm
             .read_write_bits(Data, &mut self.dr_in, &self.dr_out)?;
@@ -247,6 +247,7 @@ impl<T: JtagInterface> PinScanner<T> {
         let ir_len: usize = self.tap_infos().iter().map(|t| t.ir_len()).sum();
         self.sm.write_repeated(Instruction, 1, ir_len + 1)?;
         self.sm.switch_mode(JtagState::UpdateIR)?;
+        self.sm.switch_mode(JtagState::Idle)?;
         self.tap_cmds = vec![TapCmd::Bypass; self.tap_count()];
         self.dr_in.truncate(self.tap_count());
         self.dr_out.truncate(self.tap_count());
@@ -277,7 +278,7 @@ impl<T: JtagInterface> PinScanner<T> {
             self.tap_infos[i].push_opcode(cmd, &mut ir_data);
         }
         self.sm.write_bits(Instruction, &ir_data)?;
-        self.sm.switch_mode(JtagState::UpdateIR)?;
+        self.sm.switch_mode(JtagState::Idle)?;
         self.update()?;
         Ok(())
     }
