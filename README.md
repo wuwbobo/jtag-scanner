@@ -2,6 +2,10 @@
 
 JTAG boundary scanning module.
 
+## Usage
+
+Described in the [crate documentation](https://docs.rs/jtag-scanner).
+
 ## Acknowledgments
 
 - [jtag-boundary-scanner](https://github.com/viveris/jtag-boundary-scanner) for demonstrating the basic operations of boundary scanning.
