@@ -1,6 +1,6 @@
 //! Defines the JTAG state machine interface that the rest of the code operates on.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::VecDeque};
 
 use bitvec::{order::Lsb0, vec::BitVec};
 
@@ -57,6 +57,14 @@ pub trait JtagInterface {
         reg: Register,
         read_bits: &mut BitVec<u8, Lsb0>,
         write_bits: &BitVec<u8, Lsb0>,
+    ) -> Result<(), String>;
+
+    /// Does queued read + write operations for `count` times.
+    fn batch<E: Into<String>>(
+        &mut self,
+        count: usize,
+        writer: impl FnMut(usize, &mut BitVec<u8, Lsb0>) -> Result<(), E>,
+        reader: impl FnMut(usize, &BitVec<u8, Lsb0>) -> Result<(), E>,
     ) -> Result<(), String>;
 
     /// Shifts `bits` of ones or zeros, without automatic UpdateIR or UpdateDR;
@@ -197,6 +205,73 @@ where
         read_bits.resize(write_bits.len(), false);
         read_bits.force_align();
         read_bits.as_raw_mut_slice().copy_from_slice(&bits_read);
+        Ok(())
+    }
+
+    fn batch<E: Into<String>>(
+        &mut self,
+        count: usize,
+        mut writer: impl FnMut(usize, &mut BitVec<u8, Lsb0>) -> Result<(), E>,
+        mut reader: impl FnMut(usize, &BitVec<u8, Lsb0>) -> Result<(), E>,
+    ) -> Result<(), String>
+    where
+        Self: Sized,
+    {
+        // Do this on error. this cannot be replaced by uses of `Cable::flush`
+        // which is incompatible with the exposed queueing methods.
+        let drain = |sm: &mut Self, queue: &mut VecDeque<(usize, usize)>| {
+            while let Some((_, len)) = queue.pop_front() {
+                let _ = sm.cable.finish_read(len); // discard
+            }
+        };
+
+        let mut writer_buf = BitVec::new();
+        let mut reader_buf = BitVec::new();
+        let mut queue = VecDeque::new();
+        let mut i_write = 0; // index of the next write
+        let mut pending = false; // writer_buf holds a not yet queued transfer
+        while i_write < count || !queue.is_empty() {
+            if i_write < count {
+                if !pending {
+                    writer_buf.clear();
+                    writer_buf.force_align();
+                    if let Err(e) = writer(i_write, &mut writer_buf) {
+                        drain(self, &mut queue);
+                        return Err(e.into());
+                    }
+                    if writer_buf.is_empty() {
+                        drain(self, &mut queue);
+                        return Err("empty transfer".into());
+                    }
+                    writer_buf.force_align();
+                    pending = true;
+                }
+                if self.queue_read_write(
+                    Data,
+                    writer_buf.as_raw_slice(),
+                    last_byte_bits(&writer_buf),
+                    true,
+                ) {
+                    self.change_mode(JtagState::Idle);
+                    queue.push_back((i_write, writer_buf.len()));
+                    i_write += 1;
+                    pending = false;
+                    continue;
+                } else if queue.is_empty() {
+                    return Err("transfer does not fit into the cable's queue".into());
+                }
+            }
+            while let Some((i, len)) = queue.pop_front() {
+                let res = self.cable.finish_read(len);
+                reader_buf.resize(len, false);
+                reader_buf.force_align();
+                reader_buf.as_raw_mut_slice().copy_from_slice(&res);
+                if let Err(e) = reader(i, &reader_buf) {
+                    drain(self, &mut queue);
+                    return Err(e.into());
+                }
+            }
+        }
         Ok(())
     }
 }

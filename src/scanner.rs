@@ -52,23 +52,12 @@ impl<T: JtagInterface> PinScanner<T> {
 
     /// [TapInfo] of a TAP; the index is of [Self::tap_infos].
     pub fn get_tap_info(&self, i: usize) -> Result<TapInfo, String> {
-        if i >= self.tap_count() {
-            return Err("given TAP index exceeds TAP count".into());
-        }
-        Ok(self.tap_infos[i].clone())
+        ChainView::get_tap_info(self, i)
     }
 
     /// Current state of a TAP; the index is of [Self::tap_infos].
     pub fn get_tap_state(&self, i: usize) -> Result<TapState, String> {
-        if i >= self.tap_count() {
-            return Err("given TAP index exceeds TAP count".into());
-        }
-        Ok(match self.tap_cmds[i] {
-            TapCmd::Bypass => TapState::Bypass,
-            TapCmd::Sample => TapState::Sample,
-            TapCmd::Extest => TapState::Extest,
-            _ => unreachable!(),
-        })
+        ChainView::get_tap_state(self, i)
     }
 
     /// Switches the state of a TAP with index `i`; the index can be determined by
@@ -149,32 +138,15 @@ impl<T: JtagInterface> PinScanner<T> {
         PinId::from_name(i_tap, bsdl, pin_name)
     }
 
-    /// Checks if a given `PinId` belongs to the current `PinScanner` instance.
-    pub(crate) fn verify_pin_id(&self, pin_id: &PinId) -> Result<(), String> {
-        let tap_info = self.get_tap_info(pin_id.tap_index())?;
-        if tap_info.sessioned_tap_id() != pin_id.sessioned_tap_id() {
-            return Err("bad pin ID".into());
-        }
-        Ok(())
-    }
-
     /// Gets the pin state at the timepoint before the last [Self::update] call
     /// applied newly set pin states.
     pub fn get_pin_state(&self, pin_id: &PinId) -> Result<PinState, String> {
-        self.verify_pin_id(pin_id)?;
-        let tap_state = self.get_tap_state(pin_id.tap_index())?;
-        if tap_state == TapState::Bypass {
-            return Err("the chip that owns the pin is bypassed".into());
-        }
-        let get_val = |cell: Option<usize>| {
-            cell.map(|i| self.index_in_dr(pin_id.tap_index(), i))
-                .map(|i| self.dr_in[i])
+        let bsr_view = BsrView {
+            tap_infos: &self.tap_infos,
+            tap_cmds: &self.tap_cmds,
+            dr_in: &self.dr_in,
         };
-        Ok(PinState {
-            input: get_val(pin_id.cell_i()),
-            output: get_val(pin_id.cell_o()),
-            output_enable: get_val(pin_id.cell_oe()).map(|v| v != pin_id.cell_oe_disabler()),
-        })
+        bsr_view.get(pin_id)
     }
 
     /// Sets the new pin state that will be applyed on the next [Self::update] call.
@@ -186,36 +158,12 @@ impl<T: JtagInterface> PinScanner<T> {
     /// If `new_state` is `None`, `false` will be set in the output enable cell
     /// if the pin is tristated, otherwise an error is returned.
     pub fn set_pin_state(&mut self, pin_id: &PinId, new_state: Option<bool>) -> Result<(), String> {
-        self.verify_pin_id(pin_id)?;
-        if self.get_tap_state(pin_id.tap_index())? != TapState::Extest {
-            return Err("the chip that owns the pin is not in EXTEST mode".into());
-        }
-        if let Some(new_state) = new_state {
-            let Some(i) = pin_id
-                .cell_o()
-                .map(|i| self.index_in_dr(pin_id.tap_index(), i))
-            else {
-                return Err("the pin does not support output".into());
-            };
-            // println!("setting dr[{}] to {:?}", i, new_state);
-            *self.dr_out.get_mut(i).unwrap() = new_state;
-        }
-        if let Some(i) = pin_id
-            .cell_oe()
-            .map(|i| self.index_in_dr(pin_id.tap_index(), i))
-        {
-            // disable OE if new_state is None; enable otherwise
-            let new_state_oe = if pin_id.cell_oe_disabler() {
-                new_state.is_none()
-            } else {
-                new_state.is_some()
-            };
-            // println!("setting dr[{}] to {:?}", i, new_state_oe);
-            *self.dr_out.get_mut(i).unwrap() = new_state_oe
-        } else if new_state.is_none() {
-            return Err("the pin does not support output enable".into());
-        }
-        Ok(())
+        let mut bsr_edit = BsrEdit {
+            tap_infos: &self.tap_infos,
+            tap_cmds: &self.tap_cmds,
+            dr_out: &mut self.dr_out,
+        };
+        bsr_edit.set(pin_id, new_state)
     }
 
     /// Applies [Self::set_pin_state] calls since last [Self::update] and refreshes
@@ -309,6 +257,230 @@ impl<T: JtagInterface> PinScanner<T> {
         }
         result
     }
+}
+
+impl<T: JtagInterface> PinScanner<T> {
+    /// Executes queued read + write operations for `count` times.
+    ///
+    /// This can be used to speed up a group of transfers if each item
+    /// in the group does not depend on the result of the previous item.
+    ///
+    /// `writer` and `reader` will both be called for `count` times.
+    /// The cycle counter counts towards `count` starting from 0.
+    /// On startup, the current BSR output buffer is copied as the
+    /// buffer for `writer`.
+    ///
+    /// At the beginning of each cycle, `writer` is called with the output
+    /// buffer and the cycle counter value; any change to the buffer made by
+    /// `writer` will be captured and queued for writing to the device, and
+    /// preserved for the next `writer` call. When it is actually executed,
+    /// the captured states before this write is passed to the corresponding
+    /// call to `reader`, along with the same cycle counter value.
+    ///
+    /// Returns successfully when the last write is finished; before returning,
+    /// the output buffer (possibly modified by the last `writer` call) is
+    /// applied back to `self`, and [Self::update] is called.
+    ///
+    /// ```rust,ignore
+    /// let pins = [
+    ///     "PB0", "PB1", "PB5", "PB6", "PB7", "PB8", "PB9", "PB10", "PB11", "PB12", "PB13", "PB14",
+    ///     "PB15", "PC13", "PC14", "PC15",
+    /// ];
+    /// let pins: Vec<_> = pins
+    ///     .iter()
+    ///     .map(|n| scanner.get_pin_id(i_c6t6, *n).unwrap())
+    ///     .collect();
+    ///
+    /// scanner.set_tap_state(i_c6t6, TapState::Extest)?;
+    /// scanner.batch(
+    ///     65536,
+    ///     |i, edit| {
+    ///         // sets value `i` to the 16-bit "bus".
+    ///         for (i_pin, pin) in pins.iter().enumerate() {
+    ///             let val = ((i >> i_pin) & 1) == 1;
+    ///             edit.set(pin, Some(val))?;
+    ///         }
+    ///         Ok(())
+    ///     },
+    ///     |i, view| {
+    ///         let i_prev = if i > 0 {
+    ///             i - 1
+    ///         } else {
+    ///             return Ok(());
+    ///         };
+    ///         // `view` provides pin states before the `i`th edit is applied,
+    ///         // which equals the values set in `i - 1`th edit.
+    ///         let mut val = 0;
+    ///         for (i_pin, pin) in pins.iter().enumerate() {
+    ///             if view.get(pin)?.input.unwrap() {
+    ///                 val |= 1 << i_pin;
+    ///             }
+    ///         }
+    ///         assert_eq!(val, i_prev);
+    ///         Ok(())
+    ///     },
+    /// )?;
+    /// ```
+    pub fn batch(
+        &mut self,
+        count: usize,
+        mut writer: impl FnMut(usize, &mut BsrEdit) -> Result<(), String>,
+        mut reader: impl FnMut(usize, &BsrView) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.write_update()?;
+        let mut dr_out = self.dr_out.clone();
+        let mut bsr_edit = BsrEdit {
+            tap_infos: &self.tap_infos,
+            tap_cmds: &self.tap_cmds,
+            dr_out: &mut dr_out,
+        };
+        let res = self.sm.batch(
+            count,
+            |i, write_buf| {
+                writer(i, &mut bsr_edit)?;
+                write_buf.resize(bsr_edit.dr_out.len(), false);
+                write_buf.copy_from_bitslice(bsr_edit.dr_out);
+                Ok(())
+            },
+            |i, read_buf| {
+                let bsr_view = BsrView {
+                    tap_infos: &self.tap_infos,
+                    tap_cmds: &self.tap_cmds,
+                    dr_in: read_buf,
+                };
+                reader(i, &bsr_view)
+            },
+        );
+        self.dr_out.copy_from_bitslice(&dr_out);
+        self.update()?;
+        res
+    }
+}
+
+impl<T: JtagInterface> Drop for PinScanner<T> {
+    fn drop(&mut self) {
+        let _ = self
+            .release()
+            .inspect_err(|e| eprintln!("failed to set taps to bypass mode: {e}"));
+    }
+}
+
+/// Read-only BSR buffer. Used in the batch operation API.
+pub struct BsrView<'a> {
+    tap_infos: &'a [TapInfo],
+    tap_cmds: &'a [TapCmd],
+    dr_in: &'a BitVec<u8, Lsb0>,
+}
+
+/// Write-only BSR buffer. Used in the batch operation API.
+pub struct BsrEdit<'a> {
+    tap_infos: &'a [TapInfo],
+    tap_cmds: &'a [TapCmd],
+    dr_out: &'a mut BitVec<u8, Lsb0>,
+}
+
+impl<'a> BsrView<'a> {
+    /// Gets the pin state at the timepoint when the BSR is captured.
+    pub fn get(&self, pin_id: &PinId) -> Result<PinState, String> {
+        self.verify_pin_id(pin_id)?;
+        let tap_state = self.get_tap_state(pin_id.tap_index())?;
+        if tap_state == TapState::Bypass {
+            return Err("the chip that owns the pin is bypassed".into());
+        }
+        let get_val = |cell: Option<usize>| {
+            cell.map(|i| self.index_in_dr(pin_id.tap_index(), i))
+                .map(|i| self.dr_in[i])
+        };
+        Ok(PinState {
+            input: get_val(pin_id.cell_i()),
+            output: get_val(pin_id.cell_o()),
+            output_enable: get_val(pin_id.cell_oe()).map(|v| v != pin_id.cell_oe_disabler()),
+        })
+    }
+}
+
+impl<'a> BsrEdit<'a> {
+    /// Sets the new pin state that will be applied when this queued item is finished.
+    /// Only for setting pins with output cell in EXTEST mode.
+    ///
+    /// If `new_state` is `Some(state)`, `state` will be set in the output cell,
+    /// and `true` will be set in the output enable cell if the pin is tristated.
+    ///
+    /// If `new_state` is `None`, `false` will be set in the output enable cell
+    /// if the pin is tristated, otherwise an error is returned.
+    pub fn set(&mut self, pin_id: &PinId, new_state: Option<bool>) -> Result<(), String> {
+        self.verify_pin_id(pin_id)?;
+        if self.get_tap_state(pin_id.tap_index())? != TapState::Extest {
+            return Err("the chip that owns the pin is not in EXTEST mode".into());
+        }
+        if let Some(new_state) = new_state {
+            let Some(i) = pin_id
+                .cell_o()
+                .map(|i| self.index_in_dr(pin_id.tap_index(), i))
+            else {
+                return Err("the pin does not support output".into());
+            };
+            // println!("setting dr[{}] to {:?}", i, new_state);
+            *self.dr_out.get_mut(i).unwrap() = new_state;
+        }
+        if let Some(i) = pin_id
+            .cell_oe()
+            .map(|i| self.index_in_dr(pin_id.tap_index(), i))
+        {
+            // disable OE if new_state is None; enable otherwise
+            let new_state_oe = if pin_id.cell_oe_disabler() {
+                new_state.is_none()
+            } else {
+                new_state.is_some()
+            };
+            // println!("setting dr[{}] to {:?}", i, new_state_oe);
+            *self.dr_out.get_mut(i).unwrap() = new_state_oe
+        } else if new_state.is_none() {
+            return Err("the pin does not support output enable".into());
+        }
+        Ok(())
+    }
+}
+
+trait ChainView {
+    /// Information for TAPs on the chain.
+    fn tap_infos(&self) -> &[TapInfo];
+    fn tap_cmds(&self) -> &[TapCmd];
+
+    /// Count of TAPs on the chain.
+    fn tap_count(&self) -> usize {
+        self.tap_infos().len()
+    }
+
+    /// [TapInfo] of a TAP; the index is of [Self::tap_infos].
+    fn get_tap_info(&self, i: usize) -> Result<TapInfo, String> {
+        if i >= self.tap_count() {
+            return Err("given TAP index exceeds TAP count".into());
+        }
+        Ok(self.tap_infos()[i].clone())
+    }
+
+    /// Current state of a TAP; the index is of [Self::tap_infos].
+    fn get_tap_state(&self, i: usize) -> Result<TapState, String> {
+        if i >= self.tap_count() {
+            return Err("given TAP index exceeds TAP count".into());
+        }
+        Ok(match self.tap_cmds()[i] {
+            TapCmd::Bypass => TapState::Bypass,
+            TapCmd::Sample => TapState::Sample,
+            TapCmd::Extest => TapState::Extest,
+            _ => unreachable!(),
+        })
+    }
+
+    /// Checks if a given `PinId` belongs to the current `PinScanner` instance.
+    fn verify_pin_id(&self, pin_id: &PinId) -> Result<(), String> {
+        let tap_info = self.get_tap_info(pin_id.tap_index())?;
+        if tap_info.sessioned_tap_id() != pin_id.sessioned_tap_id() {
+            return Err("bad pin ID".into());
+        }
+        Ok(())
+    }
 
     /// Converts cell index in a DR to the index in the DR chain of TAPs.
     /// NOTE: `i_tap` and `i_cell` is unchecked here.
@@ -319,16 +491,35 @@ impl<T: JtagInterface> PinScanner<T> {
             .enumerate()
             .rev()
             .take(self.tap_count() - i_tap - 1)
-            .map(|(i, tap)| tap.dr_len(self.tap_cmds[i]))
+            .map(|(i, tap)| tap.dr_len(self.tap_cmds()[i]))
             .sum::<usize>()
             + i_cell
     }
 }
 
-impl<T: JtagInterface> Drop for PinScanner<T> {
-    fn drop(&mut self) {
-        let _ = self
-            .release()
-            .inspect_err(|e| eprintln!("failed to set taps to bypass mode: {e}"));
+impl<'a> ChainView for BsrView<'a> {
+    fn tap_infos(&self) -> &[TapInfo] {
+        self.tap_infos
+    }
+    fn tap_cmds(&self) -> &[TapCmd] {
+        self.tap_cmds
+    }
+}
+
+impl<'a> ChainView for BsrEdit<'a> {
+    fn tap_infos(&self) -> &[TapInfo] {
+        self.tap_infos
+    }
+    fn tap_cmds(&self) -> &[TapCmd] {
+        self.tap_cmds
+    }
+}
+
+impl<T: JtagInterface> ChainView for PinScanner<T> {
+    fn tap_infos(&self) -> &[TapInfo] {
+        &self.tap_infos
+    }
+    fn tap_cmds(&self) -> &[TapCmd] {
+        &self.tap_cmds
     }
 }
