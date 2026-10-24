@@ -1,8 +1,7 @@
 use bitvec::{order::Lsb0, vec::BitVec};
 
 use crate::{
-    PinIdIter,
-    group::PinGroupItem,
+    AccessMask, PinIdIter,
     jtag::{
         JtagInterface, JtagState,
         Register::{Data, Instruction},
@@ -318,15 +317,15 @@ impl<T: JtagInterface> PinScanner<T> {
         writer: impl FnMut(usize, &mut BsrEdit) -> Result<(), String>,
         reader: impl FnMut(usize, &BsrView) -> Result<(), String>,
     ) -> Result<(), String> {
-        self.batch_with_whitelist(count, writer, reader, None)
+        self.batch_with_mask(count, writer, reader, None)
     }
 
-    pub(crate) fn batch_with_whitelist(
+    pub(crate) fn batch_with_mask(
         &mut self,
         count: usize,
         mut writer: impl FnMut(usize, &mut BsrEdit) -> Result<(), String>,
         mut reader: impl FnMut(usize, &BsrView) -> Result<(), String>,
-        pins_whitelist: Option<&[PinGroupItem]>,
+        access_mask: Option<&AccessMask>,
     ) -> Result<(), String> {
         self.write_update()?;
         let mut dr_out = self.dr_out.clone();
@@ -334,7 +333,7 @@ impl<T: JtagInterface> PinScanner<T> {
             tap_infos: &self.tap_infos,
             tap_cmds: &self.tap_cmds,
             dr_out: &mut dr_out,
-            pins_whitelist,
+            access_mask,
         };
         let res = self.sm.batch(
             count,
@@ -349,7 +348,7 @@ impl<T: JtagInterface> PinScanner<T> {
                     tap_infos: &self.tap_infos,
                     tap_cmds: &self.tap_cmds,
                     dr_in: read_buf,
-                    pins_whitelist,
+                    access_mask,
                 };
                 reader(i, &bsr_view)
             },
@@ -369,31 +368,31 @@ impl<T: JtagInterface> Drop for PinScanner<T> {
 }
 
 /// Read-only BSR buffer. Used in the batch operation API.
-pub struct BsrView<'a, 'w> {
+pub struct BsrView<'a, 'm> {
     tap_infos: &'a [TapInfo],
     tap_cmds: &'a [TapCmd],
     dr_in: &'a BitVec<u8, Lsb0>,
-    pins_whitelist: Option<&'w [PinGroupItem]>,
+    access_mask: Option<&'m AccessMask>,
 }
 
 /// Write-only BSR buffer. Used in the batch operation API.
-pub struct BsrEdit<'a, 'w> {
+pub struct BsrEdit<'a, 'm> {
     tap_infos: &'a [TapInfo],
     tap_cmds: &'a [TapCmd],
     dr_out: &'a mut BitVec<u8, Lsb0>,
-    pins_whitelist: Option<&'w [PinGroupItem]>,
+    access_mask: Option<&'m AccessMask>,
 }
 
-impl<'a, 'w> BsrView<'a, 'w> {
+impl<'a, 'm> BsrView<'a, 'm> {
     pub(crate) fn new<T: JtagInterface>(
         scanner: &'a PinScanner<T>,
-        pins_whitelist: Option<&'w [PinGroupItem]>,
+        access_mask: Option<&'m AccessMask>,
     ) -> Self {
         Self {
             tap_infos: scanner.tap_infos(),
             tap_cmds: scanner.tap_cmds(),
             dr_in: &scanner.dr_in,
-            pins_whitelist,
+            access_mask,
         }
     }
 
@@ -416,16 +415,16 @@ impl<'a, 'w> BsrView<'a, 'w> {
     }
 }
 
-impl<'a, 'w> BsrEdit<'a, 'w> {
+impl<'a, 'm> BsrEdit<'a, 'm> {
     pub(crate) fn new<T: JtagInterface>(
         scanner: &'a mut PinScanner<T>,
-        pins_whitelist: Option<&'w [PinGroupItem]>,
+        access_mask: Option<&'m AccessMask>,
     ) -> Self {
         Self {
             tap_infos: &scanner.tap_infos,
             tap_cmds: &scanner.tap_cmds,
             dr_out: &mut scanner.dr_out,
-            pins_whitelist,
+            access_mask,
         }
     }
 
@@ -478,8 +477,8 @@ pub(crate) trait ChainView {
     /// States of TAPs on the chain.
     fn tap_cmds(&self) -> &[TapCmd];
 
-    /// Pins allowed to use, `None` if all allowed.
-    fn pins_whitelist(&self) -> Option<&[PinGroupItem]>;
+    /// Checker for pins allowed to use, `None` if all allowed.
+    fn access_mask(&self) -> Option<&AccessMask>;
 
     /// Count of TAPs on the chain.
     fn tap_count(&self) -> usize {
@@ -513,18 +512,12 @@ pub(crate) trait ChainView {
         if for_write && !pin_id.is_output() {
             return Err("not output pin".into());
         }
-        if let Some(list) = self.pins_whitelist() {
-            let Some(item) = list.iter().find(|PinGroupItem(_, id, _)| id == pin_id) else {
-                return Err("pin ID is outside of this pin group".into());
-            };
-            if for_write && !item.2 {
-                return Err("output not permitted in the pin group".into());
-            }
-        } else {
-            let tap_info = self.get_tap_info(pin_id.tap_index())?;
-            if tap_info.sessioned_tap_id() != pin_id.sessioned_tap_id() {
-                return Err("bad pin ID".into());
-            }
+        let tap_info = self.get_tap_info(pin_id.tap_index())?;
+        if tap_info.sessioned_tap_id() != pin_id.sessioned_tap_id() {
+            return Err("bad pin ID".into());
+        }
+        if let Some(mask) = self.access_mask() {
+            mask.check_access(pin_id, for_write)?;
         }
         Ok(())
     }
@@ -544,27 +537,27 @@ pub(crate) trait ChainView {
     }
 }
 
-impl<'a, 'w> ChainView for BsrView<'a, 'w> {
+impl<'a, 'm> ChainView for BsrView<'a, 'm> {
     fn tap_infos(&self) -> &[TapInfo] {
         self.tap_infos
     }
     fn tap_cmds(&self) -> &[TapCmd] {
         self.tap_cmds
     }
-    fn pins_whitelist(&self) -> Option<&[PinGroupItem]> {
-        self.pins_whitelist
+    fn access_mask(&self) -> Option<&AccessMask> {
+        self.access_mask
     }
 }
 
-impl<'a, 'w> ChainView for BsrEdit<'a, 'w> {
+impl<'a, 'm> ChainView for BsrEdit<'a, 'm> {
     fn tap_infos(&self) -> &[TapInfo] {
         self.tap_infos
     }
     fn tap_cmds(&self) -> &[TapCmd] {
         self.tap_cmds
     }
-    fn pins_whitelist(&self) -> Option<&[PinGroupItem]> {
-        self.pins_whitelist
+    fn access_mask(&self) -> Option<&AccessMask> {
+        self.access_mask
     }
 }
 
@@ -575,7 +568,7 @@ impl<T: JtagInterface> ChainView for PinScanner<T> {
     fn tap_cmds(&self) -> &[TapCmd] {
         &self.tap_cmds
     }
-    fn pins_whitelist(&self) -> Option<&[PinGroupItem]> {
+    fn access_mask(&self) -> Option<&AccessMask> {
         None
     }
 }

@@ -2,6 +2,7 @@
 name = "jtag-scanner"
 version = "0.1.1"
 edition = "2024"
+rust-version = "1.87"
 authors = [
     "wuwbobo <wuwbobo@outlook.com>",
 ]
@@ -13,7 +14,6 @@ license = "MIT"
 
 [dependencies]
 bitvec = "1.1.1"
-smallvec = "1.16.4"
 bsdl = "0.1.1"
 jtag_idcode = { version = "0.1.1", features = ["jep106"] }
 jtag-taps = "0.6.2"
