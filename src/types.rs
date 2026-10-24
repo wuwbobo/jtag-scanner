@@ -241,6 +241,12 @@ impl PinId {
     }
 }
 
+impl PartialEq for PinId {
+    fn eq(&self, other: &Self) -> bool {
+        self.sessioned_tap_id() == other.sessioned_tap_id() && self.i_port == other.i_port
+    }
+}
+
 /// Iterates through all [PinId]s for a TAP in the chain handled by
 /// [PinScanner](crate::PinScanner).
 #[derive(Debug)]
