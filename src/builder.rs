@@ -3,8 +3,9 @@ use std::{cell::OnceCell, path::Path, sync::Arc};
 use bitvec::vec::BitVec;
 
 use crate::{
+    Error,
     jtag::{
-        JtagInterface, JtagState,
+        Backend, JtagInterface, JtagState,
         Register::{Data, Instruction},
     },
     scanner::PinScanner,
@@ -13,26 +14,24 @@ use crate::{
 
 /// The only way to build [PinScanner]; detects IDCODEs of devices on the chain,
 /// and scan for BSDL files.
-pub struct PinScannerBuilder<T: JtagInterface> {
-    sm: T,
+pub struct PinScannerBuilder {
+    interface: Box<dyn JtagInterface>,
     idcodes: OnceCell<Vec<u32>>,
     tap_infos: Vec<TapInfo>,
     extest_keep_present: bool,
 }
 
-impl<T: JtagInterface> PinScannerBuilder<T> {
+impl PinScannerBuilder {
     /// All configuration for the `sm` needs to be done before wrapping
     /// it with the builder.
-    pub fn new(mut sm: T) -> Self {
-        let _ = sm
-            .mode_reset()
-            .inspect_err(|e| eprintln!("sm.mode_reset() failed: {e}"));
-        Self {
-            sm,
+    pub fn new<T: Backend>(cable: T) -> Result<Self, Error> {
+        let interface = cable.into_interface()?;
+        Ok(Self {
+            interface,
             idcodes: OnceCell::new(),
             tap_infos: Vec::new(),
             extest_keep_present: false,
-        }
+        })
     }
 
     /// Scans for BSDL files under `path` nonrecursively and tries to build [TapInfo]s
@@ -40,7 +39,7 @@ impl<T: JtagInterface> PinScannerBuilder<T> {
     ///
     /// Supports forced bypass of some TAPs, which needs empty bypass files with naming
     /// `<id_code_hex>_<ir_len>.bypass`.
-    pub fn scan_tap_info(&mut self, path: &Path) -> Result<(), String> {
+    pub fn scan_tap_info(&mut self, path: &Path) -> Result<(), Error> {
         if !path.exists() || !path.is_dir() {
             return Err("Invalid path".into());
         }
@@ -94,7 +93,7 @@ impl<T: JtagInterface> PinScannerBuilder<T> {
             } else if let Some((idcode, ir_len)) = bypassed.iter().find(|(i, _)| *i == idcode) {
                 tap_infos.push(TapInfo::AlwaysBypass(*idcode, *ir_len));
             } else {
-                return Err(format!("BSDL or BYPASS file of {idcode:08x} not found"));
+                return Err(format!("BSDL or BYPASS file of {idcode:08x} not found").into());
             };
         }
 
@@ -104,7 +103,7 @@ impl<T: JtagInterface> PinScannerBuilder<T> {
 
     /// Adds `TapInfo` manually for the next TAP.
     /// Call this for `builder.get_id_codes().len()` times.
-    pub fn add_tap_info(&mut self, info: TapInfo) -> Result<(), String> {
+    pub fn add_tap_info(&mut self, info: TapInfo) -> Result<(), Error> {
         let idcodes = self.get_id_codes()?;
         if self.tap_infos.len() >= idcodes.len() {
             return Err("already having enough `TapInfo`".into());
@@ -128,47 +127,51 @@ impl<T: JtagInterface> PinScannerBuilder<T> {
     }
 
     /// Builds the [PinScanner] if there are enough [TapInfo]s.
-    pub fn build(mut self) -> Result<PinScanner<T>, String> {
+    pub fn build(mut self) -> Result<PinScanner, Error> {
         if self.tap_infos.len() != self.get_id_codes()?.len() {
             return Err("not having enough `TapInfo`".into());
         }
 
         // verify IR length
-        let ir_len = self.sm.measure_ir_len()?;
+        let ir_len = self.interface.measure_ir_len()?;
         let info_ir_len: usize = self.tap_infos.iter().map(|info| info.ir_len()).sum();
         if info_ir_len != ir_len {
             return Err(format!(
                 "IR length mismatch, current: {}, from given info: {}",
                 ir_len, info_ir_len,
-            ));
+            )
+            .into());
         }
 
-        PinScanner::build(self.sm, self.tap_infos, ir_len, self.extest_keep_present)
+        PinScanner::build(
+            self.interface,
+            self.tap_infos,
+            ir_len,
+            self.extest_keep_present,
+        )
     }
 
     /// Gets IDCODEs of all TAPs on the chain, from TDI to TDO.
-    pub fn get_id_codes(&mut self) -> Result<Vec<u32>, String> {
+    pub fn get_id_codes(&mut self) -> Result<Vec<u32>, Error> {
         if let Some(idcodes) = self.idcodes.get() {
             return Ok(idcodes.clone());
         }
 
         let dev_cnt = self.count_devices()?;
 
-        self.sm.mode_reset()?; // test logic reset
-        let dr_len = self.sm.measure_dr_len()?;
+        self.interface.mode_reset()?; // test logic reset
+        let dr_len = self.interface.measure_dr_len()?;
         if dr_len != dev_cnt * 32 {
-            return Err(format!(
-                "Found device without IDCODE register, dr_len: {dr_len}"
-            ));
+            return Err(format!("Found device without IDCODE register, dr_len: {dr_len}").into());
         }
 
-        self.sm.mode_reset()?; // test logic reset
+        self.interface.mode_reset()?; // test logic reset
 
-        self.sm.switch_mode(JtagState::CaptureDR)?;
+        self.interface.switch_mode(JtagState::CaptureDR)?;
         // reads IDCODEs starting from the last device on the chain
         let mut raw_idcodes = BitVec::repeat(false, 32 * dev_cnt);
-        self.sm.read_bits(Data, &mut raw_idcodes)?;
-        self.sm.mode_reset()?; // test logic reset
+        self.interface.read_bits(Data, &mut raw_idcodes)?;
+        self.interface.mode_reset()?; // test logic reset
 
         let mut idcodes = Vec::new();
         for raw_idcode in raw_idcodes.as_raw_slice().chunks(4) {
@@ -184,13 +187,13 @@ impl<T: JtagInterface> PinScannerBuilder<T> {
         Ok(idcodes)
     }
 
-    fn count_devices(&mut self) -> Result<usize, String> {
-        self.sm.mode_reset()?; // test logic reset
+    fn count_devices(&mut self) -> Result<usize, Error> {
+        self.interface.mode_reset()?; // test logic reset
 
         // make sure all TAPs are in bypass mode
-        self.sm.write_repeated(Instruction, 1, 1024)?;
-        self.sm.switch_mode(JtagState::Idle)?;
+        self.interface.write_repeated(Instruction, 1, 1024)?;
+        self.interface.switch_mode(JtagState::Idle)?;
 
-        self.sm.measure_dr_len()
+        self.interface.measure_dr_len()
     }
 }

@@ -1,6 +1,8 @@
 use bitvec::{order::Lsb0, vec::BitVec};
 use std::sync::Arc;
 
+use crate::Error;
+
 /// Needed information for each TAP on the chain.
 #[derive(Debug, Clone)]
 pub enum TapInfo {
@@ -186,7 +188,7 @@ impl PinId {
         i_tap: usize,
         bsdl: Arc<bsdl::Entity>,
         pin_name: &str,
-    ) -> Result<PinId, String> {
+    ) -> Result<PinId, Error> {
         let pin_name = pin_name.trim().to_uppercase();
         if let Some(i_port) = bsdl
             .ports()
@@ -195,7 +197,7 @@ impl PinId {
         {
             Self::from_port_index(i_tap, bsdl, i_port)
         } else {
-            Err(format!("port name '{}' not found in BSDL", pin_name))
+            Err(format!("port name '{}' not found in BSDL", pin_name).into())
         }
     }
 
@@ -203,7 +205,7 @@ impl PinId {
         i_tap: usize,
         bsdl: Arc<bsdl::Entity>,
         i_port: usize,
-    ) -> Result<PinId, String> {
+    ) -> Result<PinId, Error> {
         let port = &bsdl.ports()[i_port];
         use bsdl::PortDirection::*;
         let cell_i = if matches!(port.dir, In | Inout) {
@@ -285,10 +287,22 @@ impl Iterator for PinIdIter {
 /// Lastly captured states of scan cells of a pin.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PinState {
+    pub(crate) input: Option<bool>,
+    pub(crate) output: Option<bool>,
+    pub(crate) output_enable: Option<bool>,
+}
+
+impl PinState {
     /// This is the actual input state.
-    pub input: Option<bool>,
+    pub fn input(&self) -> Option<bool> {
+        self.input
+    }
     /// The intended output value from the internal logic.
-    pub output: Option<bool>,
+    pub fn output(&self) -> Option<bool> {
+        self.output
+    }
     /// The intended output enable value from the internal logic.
-    pub output_enable: Option<bool>,
+    pub fn output_enable(&self) -> Option<bool> {
+        self.output_enable
+    }
 }

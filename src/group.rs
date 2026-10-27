@@ -3,20 +3,18 @@ use std::{cell::RefCell, rc::Rc};
 use bitvec::{order::Lsb0, vec::BitVec};
 
 use crate::{
-    BsrEdit, BsrView, ChainView, PinId, PinScanner, PinState, TapCmd, TapInfo, jtag::JtagInterface,
+    BsrEdit, BsrView, ChainView, Error, ErrorKind, PinId, PinScanner, PinState, TapCmd, TapInfo,
 };
 
 /// Groups pins and assign given names to each pin, restricting the
 /// usage of [PinScanner] within the group. Implements [PinGroup].
-pub struct PinGrouper<T: JtagInterface> {
-    scanner: Rc<RefCell<PinScanner<T>>>,
+pub struct PinGroup {
+    scanner: Rc<RefCell<PinScanner>>,
     pins: Vec<PinGroupItem>,
     mask: AccessMask,
 }
 
 /// Items required during construction of [PinGroup].
-/// - `String`: the given name for the pin, like `MISO`, `SCK`, or `D0`.
-/// - `bool`: whether write access is allowed for this pin.
 #[derive(Debug)]
 pub struct PinGroupItem {
     name: String,
@@ -26,6 +24,8 @@ pub struct PinGroupItem {
 
 impl PinGroupItem {
     /// Creates an item.
+    /// - `name`: the given name for the pin, like `MISO`, `SCK`, or `D0`.
+    /// - `writable`: whether write access is allowed for this pin.
     pub fn new(name: &str, pin_id: PinId, writable: bool) -> Self {
         Self {
             name: name.to_string().trim().to_uppercase(),
@@ -53,39 +53,7 @@ impl PinGroupItem {
     }
 }
 
-/// Trait for IO adpters to operate on the JTAG boundary scanner.
-pub trait PinGroup {
-    /// Iterates through all [PinId]s in the group, with their given names.
-    fn pin_ids(&self) -> impl Iterator<Item = &PinGroupItem>;
-
-    /// Gets a pin identifier by its name given in the group.
-    fn get_pin_id(&self, pin_name: &str) -> Result<PinId, String>;
-
-    /// Similar to [PinScanner::get_pin_state], disabling access to pins
-    /// outside the group.
-    fn get_pin_state(&self, pin_id: &PinId) -> Result<PinState, String>;
-
-    /// Similar to [PinScanner::set_pin_state], disabling access to pins
-    /// outside the group, or pins without write access.
-    fn set_pin_state(&mut self, pin_id: &PinId, new_state: Option<bool>) -> Result<(), String>;
-
-    /// See [PinScanner::update].
-    fn update(&mut self) -> Result<(), String>;
-
-    /// See [PinScanner::write_update].
-    fn write_update(&mut self) -> Result<(), String>;
-
-    /// Similar to [PinScanner::batch], disabling access to pins outside
-    /// the group; disables writes to pins without write access.
-    fn batch(
-        &mut self,
-        count: usize,
-        writer: impl FnMut(usize, &mut BsrEdit) -> Result<(), String>,
-        reader: impl FnMut(usize, &BsrView) -> Result<(), String>,
-    ) -> Result<(), String>;
-}
-
-impl<T: JtagInterface> PinGrouper<T> {
+impl PinGroup {
     /// Builds the [PinGroup] with the scanner managed by `Rc` of `RefCell`.
     /// Multi-thread operation is unsupported.
     ///
@@ -93,9 +61,9 @@ impl<T: JtagInterface> PinGrouper<T> {
     /// against any existing pin group that has the same pin for write access.
     /// This is intended for flexibility; check it manually if needed.
     pub fn build(
-        scanner: &Rc<RefCell<PinScanner<T>>>,
+        scanner: &Rc<RefCell<PinScanner>>,
         pins: impl IntoIterator<Item = PinGroupItem>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, Error> {
         let sc = scanner.borrow();
         let mut vec_pins = Vec::new();
         let mut mask = AccessMask::new(sc.tap_infos());
@@ -116,14 +84,14 @@ impl<T: JtagInterface> PinGrouper<T> {
             mask,
         })
     }
-}
 
-impl<T: JtagInterface> PinGroup for PinGrouper<T> {
-    fn pin_ids(&self) -> impl Iterator<Item = &PinGroupItem> {
+    /// Iterates through all [PinId]s in the group, with their given names.
+    pub fn pin_ids(&self) -> impl Iterator<Item = &PinGroupItem> {
         self.pins.iter()
     }
 
-    fn get_pin_id(&self, pin_name: &str) -> Result<PinId, String> {
+    /// Gets a pin identifier by its name given in the group.
+    pub fn get_pin_id(&self, pin_name: &str) -> Result<PinId, Error> {
         let pin_name = pin_name.trim().to_uppercase();
         self.pin_ids()
             .find(|item| item.name == pin_name)
@@ -131,47 +99,43 @@ impl<T: JtagInterface> PinGroup for PinGrouper<T> {
             .map(|item| item.pin_id().clone())
     }
 
-    fn get_pin_state(&self, pin_id: &PinId) -> Result<PinState, String> {
-        let scanner = self.scanner.try_borrow().map_err(|_| "scanner is busy")?;
+    /// Similar to [PinScanner::get_pin_state], disabling access to pins
+    /// outside the group.
+    pub fn get_pin_state(&self, pin_id: &PinId) -> Result<PinState, Error> {
+        let scanner = self.scanner.try_borrow()?;
         let bsr_view = BsrView::new(&scanner, Some(&self.mask));
         bsr_view.get(pin_id)
     }
 
-    fn set_pin_state(&mut self, pin_id: &PinId, new_state: Option<bool>) -> Result<(), String> {
-        let mut scanner = self
-            .scanner
-            .try_borrow_mut()
-            .map_err(|_| "scanner is busy")?;
+    /// Similar to [PinScanner::set_pin_state], disabling access to pins
+    /// outside the group, or pins without write access.
+    pub fn set_pin_state(&mut self, pin_id: &PinId, new_state: Option<bool>) -> Result<(), Error> {
+        let mut scanner = self.scanner.try_borrow_mut()?;
         let mut bsr_edit = BsrEdit::new(&mut scanner, Some(&self.mask));
         bsr_edit.set(pin_id, new_state)
     }
 
-    fn update(&mut self) -> Result<(), String> {
-        let mut scanner = self
-            .scanner
-            .try_borrow_mut()
-            .map_err(|_| "scanner is busy")?;
+    /// See [PinScanner::update].
+    pub fn update(&mut self) -> Result<(), Error> {
+        let mut scanner = self.scanner.try_borrow_mut()?;
         scanner.update()
     }
 
-    fn write_update(&mut self) -> Result<(), String> {
-        let mut scanner = self
-            .scanner
-            .try_borrow_mut()
-            .map_err(|_| "scanner is busy")?;
+    /// See [PinScanner::write_update]. Makes no sense without previous writes.
+    pub fn write_update(&mut self) -> Result<(), Error> {
+        let mut scanner = self.scanner.try_borrow_mut()?;
         scanner.write_update()
     }
 
-    fn batch(
+    /// Similar to [PinScanner::batch], disabling access to pins outside
+    /// the group; disables writes to pins without write access.
+    pub fn batch(
         &mut self,
         count: usize,
-        mut writer: impl FnMut(usize, &mut BsrEdit) -> Result<(), String>,
-        mut reader: impl FnMut(usize, &BsrView) -> Result<(), String>,
-    ) -> Result<(), String> {
-        let mut scanner = self
-            .scanner
-            .try_borrow_mut()
-            .map_err(|_| "scanner is busy")?;
+        mut writer: impl FnMut(usize, &mut BsrEdit) -> Result<(), Error>,
+        mut reader: impl FnMut(usize, &BsrView) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let mut scanner = self.scanner.try_borrow_mut()?;
         scanner.batch_with_mask(
             count,
             |i, edit| writer(i, edit),
@@ -204,7 +168,7 @@ impl AccessMask {
         }
     }
 
-    pub fn check_access(&self, pin_id: &PinId, for_write: bool) -> Result<(), String> {
+    pub fn check_access(&self, pin_id: &PinId, for_write: bool) -> Result<(), Error> {
         let mask = &self.0[pin_id.tap_index()];
         let valid = if !for_write {
             pin_id.cell_i().is_some_and(|i| mask[i])
@@ -214,7 +178,10 @@ impl AccessMask {
         if valid {
             Ok(())
         } else {
-            Err("operation not permitted by the pin group".into())
+            Error::result(
+                ErrorKind::PinGroupLimit,
+                "operation not permitted by the pin group",
+            )
         }
     }
 }

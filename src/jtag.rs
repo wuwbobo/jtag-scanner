@@ -1,6 +1,10 @@
 //! Defines the JTAG state machine interface that the rest of the code operates on.
 
-use std::{borrow::Cow, collections::VecDeque};
+use std::{
+    borrow::Cow,
+    collections::VecDeque,
+    ops::{Deref, DerefMut},
+};
 
 use bitvec::{order::Lsb0, vec::BitVec};
 
@@ -13,6 +17,8 @@ use jtag_taps::{
 };
 
 pub use jtag_taps::statemachine::{JtagState, Register};
+
+use crate::{Error, ErrorKind::BrokenChain};
 
 /// JTAG state machine interface.
 ///
@@ -28,22 +34,22 @@ pub trait JtagInterface {
     /// Always flushes the command; not for queued operations.
     ///
     /// TDI line is held high while clocking out TMS bits.
-    fn switch_mode(&mut self, new_state: JtagState) -> Result<(), String>;
+    fn switch_mode(&mut self, new_state: JtagState) -> Result<(), Error>;
 
     /// Resets the state machine.
-    fn mode_reset(&mut self) -> Result<(), String> {
+    fn mode_reset(&mut self) -> Result<(), Error> {
         self.switch_mode(JtagState::Reset)
     }
 
     /// Writes `bits` to IR or DR (chosen by `reg`), ignoring data on TDO.
     ///
     /// Goes to PauseIR or PauseDR afterwards.
-    fn write_bits(&mut self, reg: Register, bits: &BitVec<u8, Lsb0>) -> Result<(), String>;
+    fn write_bits(&mut self, reg: Register, bits: &BitVec<u8, Lsb0>) -> Result<(), Error>;
 
     /// Reads IR or DR (chosen by `reg`) into `bits`, clocking out ones on TDI.
     ///
     /// Remains in ShiftIR or ShiftDR afterwards.
-    fn read_bits(&mut self, reg: Register, bits: &mut BitVec<u8, Lsb0>) -> Result<(), String>;
+    fn read_bits(&mut self, reg: Register, bits: &mut BitVec<u8, Lsb0>) -> Result<(), Error>;
 
     /// Writes `write_bits` to IR or DR (chosen by `reg`), reads previous data
     /// into `read_bits`.
@@ -57,24 +63,20 @@ pub trait JtagInterface {
         reg: Register,
         read_bits: &mut BitVec<u8, Lsb0>,
         write_bits: &BitVec<u8, Lsb0>,
-    ) -> Result<(), String>;
+    ) -> Result<(), Error>;
 
     /// Does queued read + write operations for `count` times.
-    fn batch<E: Into<String>>(
+    #[allow(clippy::type_complexity)]
+    fn batch(
         &mut self,
         count: usize,
-        writer: impl FnMut(usize, &mut BitVec<u8, Lsb0>) -> Result<(), E>,
-        reader: impl FnMut(usize, &BitVec<u8, Lsb0>) -> Result<(), E>,
-    ) -> Result<(), String>;
+        writer: &mut dyn FnMut(usize, &mut BitVec<u8, Lsb0>) -> Result<(), Error>,
+        reader: &mut dyn FnMut(usize, &BitVec<u8, Lsb0>) -> Result<(), Error>,
+    ) -> Result<(), Error>;
 
     /// Shifts `bits` of ones or zeros, without automatic UpdateIR or UpdateDR;
     /// however it may goto PauseIR or PauseDR afterwards. `one_or_zero` can be 0 or 1.
-    fn write_repeated(
-        &mut self,
-        reg: Register,
-        one_or_zero: u8,
-        bits: usize,
-    ) -> Result<(), String> {
+    fn write_repeated(&mut self, reg: Register, one_or_zero: u8, bits: usize) -> Result<(), Error> {
         // limits the length of each transfer to 512 bits to avoid the limits
         // in some `jtag_taps` cable implementations.
         let (cnt_blocks, cnt_rem) = (bits / 512, bits % 512);
@@ -88,7 +90,7 @@ pub trait JtagInterface {
 
     /// Measures the total IR length of the scan chain, puts all TAPs
     /// in BYPASS mode afterwards.
-    fn measure_ir_len(&mut self) -> Result<usize, String> {
+    fn measure_ir_len(&mut self) -> Result<usize, Error> {
         // fill IR chain with 0s, 1024 bits should be enough for any case
         self.write_repeated(Instruction, 0, 1024)?;
 
@@ -104,11 +106,11 @@ pub trait JtagInterface {
             }
             ir_len += 1;
             if ir_len > 1024 {
-                return Err("broken chain: TDO holds 0".into());
+                return Error::result(BrokenChain, "TDO holds 0");
             }
         }
         if ir_len < 2 {
-            return Err("broken chain: TDO holds 1".into());
+            return Error::result(BrokenChain, "TDO holds 1");
         }
         Ok(ir_len)
     }
@@ -117,7 +119,7 @@ pub trait JtagInterface {
     ///
     /// NOTE: this can be used only if updating the current DR chain with all 0s
     /// is safe to do, e.g. when measuring the chain of IDCODE registers.
-    fn measure_dr_len(&mut self) -> Result<usize, String> {
+    fn measure_dr_len(&mut self) -> Result<usize, Error> {
         // fill DR chain with 1s, 65536 bits should be enough for any case
         self.write_repeated(Data, 1, 65536)?;
 
@@ -133,13 +135,43 @@ pub trait JtagInterface {
             }
             dr_len += 1;
             if dr_len > 1024 {
-                return Err("broken chain: TDO holds 1".into());
+                return Error::result(BrokenChain, "TDO holds 1");
             }
         }
         if dr_len < 1 {
-            return Err("broken chain: TDO holds 0".into());
+            return Error::result(BrokenChain, "TDO holds 0");
         }
         Ok(dr_len)
+    }
+}
+
+/// Trait for supported cable drivers (currently all of them are from `jtag-taps`).
+pub trait Backend {
+    #[doc(hidden)]
+    fn into_interface(self) -> Result<Box<dyn JtagInterface>, Error>;
+}
+
+impl<T: jtag_taps::cable::Cable + 'static> Backend for T {
+    fn into_interface(self) -> Result<Box<dyn JtagInterface>, Error> {
+        let wrapper = CableWrapper(self);
+        let mut sm: Box<dyn JtagInterface> =
+            Box::new(jtag_taps::statemachine::JtagSM::new(wrapper));
+        sm.mode_reset()?;
+        Ok(sm)
+    }
+}
+
+struct CableWrapper<T: jtag_taps::cable::Cable>(T);
+
+impl<T: jtag_taps::cable::Cable> Deref for CableWrapper<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl<T: jtag_taps::cable::Cable> DerefMut for CableWrapper<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 
@@ -160,13 +192,13 @@ where
     T: std::ops::DerefMut<Target = U>,
     U: Cable + ?Sized,
 {
-    fn switch_mode(&mut self, new_state: JtagState) -> Result<(), String> {
+    fn switch_mode(&mut self, new_state: JtagState) -> Result<(), Error> {
         self.change_mode(new_state);
         self.cable.flush();
         Ok(())
     }
 
-    fn write_bits(&mut self, reg: Register, bits: &BitVec<u8, Lsb0>) -> Result<(), String> {
+    fn write_bits(&mut self, reg: Register, bits: &BitVec<u8, Lsb0>) -> Result<(), Error> {
         if bits.is_empty() {
             return Ok(());
         }
@@ -176,7 +208,7 @@ where
         Ok(())
     }
 
-    fn read_bits(&mut self, reg: Register, bits: &mut BitVec<u8, Lsb0>) -> Result<(), String> {
+    fn read_bits(&mut self, reg: Register, bits: &mut BitVec<u8, Lsb0>) -> Result<(), Error> {
         if bits.is_empty() {
             return Ok(());
         }
@@ -191,7 +223,7 @@ where
         reg: Register,
         read_bits: &mut BitVec<u8, Lsb0>,
         write_bits: &BitVec<u8, Lsb0>,
-    ) -> Result<(), String> {
+    ) -> Result<(), Error> {
         if write_bits.is_empty() {
             return Ok(());
         }
@@ -208,15 +240,12 @@ where
         Ok(())
     }
 
-    fn batch<E: Into<String>>(
+    fn batch(
         &mut self,
         count: usize,
-        mut writer: impl FnMut(usize, &mut BitVec<u8, Lsb0>) -> Result<(), E>,
-        mut reader: impl FnMut(usize, &BitVec<u8, Lsb0>) -> Result<(), E>,
-    ) -> Result<(), String>
-    where
-        Self: Sized,
-    {
+        writer: &mut dyn FnMut(usize, &mut BitVec<u8, Lsb0>) -> Result<(), Error>,
+        reader: &mut dyn FnMut(usize, &BitVec<u8, Lsb0>) -> Result<(), Error>,
+    ) -> Result<(), Error> {
         // Do this on error. this cannot be replaced by uses of `Cable::flush`
         // which is incompatible with the exposed queueing methods.
         let drain = |sm: &mut Self, queue: &mut VecDeque<(usize, usize)>| {
@@ -237,7 +266,7 @@ where
                     writer_buf.force_align();
                     if let Err(e) = writer(i_write, &mut writer_buf) {
                         drain(self, &mut queue);
-                        return Err(e.into());
+                        return Err(e);
                     }
                     if writer_buf.is_empty() {
                         drain(self, &mut queue);
@@ -268,7 +297,7 @@ where
                 reader_buf.as_raw_mut_slice().copy_from_slice(&res);
                 if let Err(e) = reader(i, &reader_buf) {
                     drain(self, &mut queue);
-                    return Err(e.into());
+                    return Err(e);
                 }
             }
         }

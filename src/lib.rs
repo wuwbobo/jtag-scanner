@@ -9,9 +9,8 @@
 //! ### Building the `PinScanner`
 //! - Check for [compatible debug adapters](jtag_taps::cable), connect the adapter to the target,
 //!   connect the adapter to the PC and power on the target;
-//! - Construct a [Cable](jtag_taps::cable::Cable) instance and build the
-//!   [JtagSM](jtag_taps::statemachine::JtagSM);
-//! - Create a [`PinScannerBuilder`] with the `JtagSM` instance, and (optionally) check the result of
+//! - Construct and configure a [Cable](jtag_taps::cable::Cable) instance;
+//! - Create a [`PinScannerBuilder`] with the `Cable` instance, and (optionally) check the result of
 //!   [get_id_codes](PinScannerBuilder::get_id_codes) to make sure the TAP chain is working;
 //! - With the builder, call [scan_tap_info](PinScannerBuilder::scan_tap_info) with a directory path
 //!   for scanning BSDL files, then call [build](PinScannerBuilder::build) to build the [`PinScanner`].
@@ -31,11 +30,14 @@
 
 #![deny(unsafe_code)]
 
-pub mod jtag;
-
 mod builder;
+mod error;
 mod group;
+mod jtag;
 mod scanner;
 mod types;
 
-pub use {builder::*, group::*, scanner::*, types::*};
+pub use {builder::*, error::*, group::*, jtag::Backend, scanner::*, types::*};
+
+#[cfg(feature = "protocol")]
+pub mod protocols;
