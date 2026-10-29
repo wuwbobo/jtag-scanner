@@ -30,7 +30,7 @@ impl PinScanner {
     ) -> Result<Self, Error> {
         // make sure all TAPs are in bypass mode
         sm.write_repeated(Instruction, 1, ir_len + 1)?;
-        sm.switch_mode(JtagState::Idle)?;
+        sm.switch_mode(JtagState::Idle, true)?;
         let cnt_taps = tap_infos.len();
         Ok(Self {
             sm,
@@ -120,6 +120,10 @@ impl PinScanner {
         Ok(())
     }
 
+    pub(crate) fn is_extesting(&self) -> bool {
+        self.tap_cmds.contains(&TapCmd::Extest)
+    }
+
     /// Iterates through all [PinId]s for a TAP in the chain.
     /// `i_tap` can be determined by finding in [Self::tap_infos].
     pub fn pin_ids_for_tap(&self, i_tap: usize) -> Result<PinIdIter, Error> {
@@ -162,10 +166,14 @@ impl PinScanner {
     /// the capture buffer for later [Self::get_pin_state] calls with the values
     /// before setting new pin states.
     pub fn update(&mut self) -> Result<(), Error> {
-        self.sm.switch_mode(JtagState::CaptureDR)?;
+        self.sm.switch_mode(JtagState::CaptureDR, false)?;
         self.sm
             .read_write_bits(Data, &mut self.dr_in, &self.dr_out)?;
-        self.sm.switch_mode(JtagState::Idle)?;
+        if self.is_extesting() {
+            // flush it (which passes through UpdateDR), otherwise it may be
+            // executed in the next cycle.
+            self.sm.switch_mode(JtagState::Idle, true)?;
+        }
         Ok(())
     }
 
@@ -173,10 +181,13 @@ impl PinScanner {
     /// later [Self::get_pin_state] calls will be influenced by the newly set values.
     /// This makes no sense if no TAP is in EXTEST mode.
     pub fn write_update(&mut self) -> Result<(), Error> {
+        if !self.is_extesting() {
+            return self.update();
+        }
         // apply written bits.
-        self.sm.write_bits(Data, &self.dr_out)?;
-        self.sm.switch_mode(JtagState::Idle)?;
-        // this is just for reading.
+        self.sm.write_bits(Data, &self.dr_out, false)?;
+        self.sm.switch_mode(JtagState::Idle, false)?;
+        // flush and capture DR again after updating DR.
         self.sm
             .read_write_bits(Data, &mut self.dr_in, &self.dr_out)?;
         Ok(())
@@ -186,8 +197,8 @@ impl PinScanner {
     pub fn release(&mut self) -> Result<(), Error> {
         let ir_len: usize = self.tap_infos().iter().map(|t| t.ir_len()).sum();
         self.sm.write_repeated(Instruction, 1, ir_len + 1)?;
-        self.sm.switch_mode(JtagState::UpdateIR)?;
-        self.sm.switch_mode(JtagState::Idle)?;
+        self.sm.switch_mode(JtagState::UpdateIR, true)?;
+        self.sm.switch_mode(JtagState::Idle, true)?;
         self.tap_cmds = vec![TapCmd::Bypass; self.tap_count()];
         self.dr_in.truncate(self.tap_count());
         self.dr_out.truncate(self.tap_count());
@@ -217,8 +228,8 @@ impl PinScanner {
         for (i, &cmd) in self.tap_cmds.iter().enumerate().rev() {
             self.tap_infos[i].push_opcode(cmd, &mut ir_data);
         }
-        self.sm.write_bits(Instruction, &ir_data)?;
-        self.sm.switch_mode(JtagState::Idle)?;
+        self.sm.write_bits(Instruction, &ir_data, true)?;
+        self.sm.switch_mode(JtagState::Idle, true)?;
         self.update()?;
         Ok(())
     }
@@ -304,7 +315,7 @@ impl PinScanner {
     ///         // which equals the values set in `i - 1`th edit.
     ///         let mut val = 0;
     ///         for (i_pin, pin) in pins.iter().enumerate() {
-    ///             if view.get(pin)?.input.unwrap() {
+    ///             if view.get(pin)?.input().unwrap() {
     ///                 val |= 1 << i_pin;
     ///             }
     ///         }

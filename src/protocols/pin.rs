@@ -24,8 +24,8 @@ pub struct In {
 }
 
 impl In {
-    /// Builds the adapter.
-    pub fn build(scanner: &Rc<RefCell<PinScanner>>, pin_id: PinId) -> Result<Self, Error> {
+    /// Creates the adapter.
+    pub fn new(scanner: &Rc<RefCell<PinScanner>>, pin_id: PinId) -> Result<Self, Error> {
         if !pin_id.is_input() {
             return Error::result(WrongPinType, "not input pin");
         }
@@ -60,8 +60,8 @@ pub struct Out {
 }
 
 impl Out {
-    /// Builds the adapter.
-    pub fn build(scanner: &Rc<RefCell<PinScanner>>, pin_id: PinId) -> Result<Self, Error> {
+    /// Creates the adapter.
+    pub fn new(scanner: &Rc<RefCell<PinScanner>>, pin_id: PinId) -> Result<Self, Error> {
         if !pin_id.is_output() {
             return Error::result(WrongPinType, "not output pin");
         }
@@ -105,10 +105,11 @@ pub struct InOut {
 }
 
 impl InOut {
-    /// Builds the adapter.
+    /// Creates the adapter.
     /// - `init_val`: this is used to call `PinScanner::set_pin_state` for
-    ///   making clear of the initial value.
-    pub fn build(
+    ///   making clear of the initial state. If it is `None`, the output will
+    ///   be disabled until [Self::set_output_enable] is called with `true`.
+    pub fn new(
         scanner: &Rc<RefCell<PinScanner>>,
         pin_id: PinId,
         init_val: Option<bool>,
@@ -130,7 +131,9 @@ impl InOut {
     }
 
     /// If the pin is tristated, disables output immediately if `val` is false;
-    /// otherwise enables output.
+    /// otherwise enables output: it is enabled immediately if there is a
+    /// previously remembered value; without a previously set value, it is
+    /// enabled on the next `set_state` call (including `set_low`, `set_high`).
     ///
     /// If the pin is not tristated, returns error if `val` is false, otherwise
     /// does nothing.
@@ -146,7 +149,7 @@ impl InOut {
         }
         if enable {
             self.output_enable = true;
-            if let Some(last_output) = self.output_value {
+            if let Some(&last_output) = self.output_value.as_ref() {
                 self.set_state(if last_output { High } else { Low })?;
             }
         } else {

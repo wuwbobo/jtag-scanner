@@ -167,7 +167,7 @@ impl PinScannerBuilder {
 
         self.interface.mode_reset()?; // test logic reset
 
-        self.interface.switch_mode(JtagState::CaptureDR)?;
+        self.interface.switch_mode(JtagState::CaptureDR, false)?;
         // reads IDCODEs starting from the last device on the chain
         let mut raw_idcodes = BitVec::repeat(false, 32 * dev_cnt);
         self.interface.read_bits(Data, &mut raw_idcodes)?;
@@ -192,7 +192,7 @@ impl PinScannerBuilder {
 
         // make sure all TAPs are in bypass mode
         self.interface.write_repeated(Instruction, 1, 1024)?;
-        self.interface.switch_mode(JtagState::Idle)?;
+        self.interface.switch_mode(JtagState::Idle, true)?;
 
         self.interface.measure_dr_len()
     }

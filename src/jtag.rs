@@ -1,24 +1,51 @@
 //! Defines the JTAG state machine interface that the rest of the code operates on.
 
-use std::{
-    borrow::Cow,
-    collections::VecDeque,
-    ops::{Deref, DerefMut},
-};
-
 use bitvec::{order::Lsb0, vec::BitVec};
 
-use jtag_taps::{
-    cable::Cable,
-    statemachine::{
-        JtagSM,
-        Register::{Data, Instruction},
-    },
+use crate::{
+    Error,
+    ErrorKind::BrokenChain,
+    jtag::Register::{Data, Instruction},
 };
 
-pub use jtag_taps::statemachine::{JtagState, Register};
+#[cfg(feature = "backend-jtag-taps")]
+mod jtag_taps;
+#[cfg(feature = "backend-jtag-taps")]
+pub use ::jtag_taps::statemachine::{JtagState, Register};
 
-use crate::{Error, ErrorKind::BrokenChain};
+#[cfg(not(feature = "backend-jtag-taps"))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Register {
+    Data,
+    Instruction,
+}
+
+#[cfg(not(feature = "backend-jtag-taps"))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum JtagState {
+    Reset = 0,
+    Idle = 1,
+    SelectDR = 2,
+    CaptureDR = 3,
+    ShiftDR = 4,
+    Exit1DR = 5,
+    PauseDR = 6,
+    Exit2DR = 7,
+    UpdateDR = 8,
+    SelectIR = 9,
+    CaptureIR = 10,
+    ShiftIR = 11,
+    Exit1IR = 12,
+    PauseIR = 13,
+    Exit2IR = 14,
+    UpdateIR = 15,
+}
+
+/// Trait for supported JTAG adapter drivers (currently all of them are from `jtag-taps`).
+pub trait Backend {
+    #[doc(hidden)]
+    fn into_interface(self) -> Result<Box<dyn JtagInterface>, Error>;
+}
 
 /// JTAG state machine interface.
 ///
@@ -27,32 +54,38 @@ use crate::{Error, ErrorKind::BrokenChain};
 ///   of the current IR/DR chain of all TAPs.
 /// - These functions all make sure the state is in ShiftIR or ShiftDR
 ///   before actually shifting data.
-/// - These functions all make sure to finish the cable transfer instead
-///   of just queueing the operations.
 pub trait JtagInterface {
     /// Changes the mode of the state machine through the shortest path.
-    /// Always flushes the command; not for queued operations.
+    /// Does flushing if `flush` is true.
+    ///
+    /// This does not need to be used in closures for [Self::batch].
     ///
     /// TDI line is held high while clocking out TMS bits.
-    fn switch_mode(&mut self, new_state: JtagState) -> Result<(), Error>;
+    fn switch_mode(&mut self, new_state: JtagState, flush: bool) -> Result<(), Error>;
 
-    /// Resets the state machine.
+    /// (Flushing) Resets the state machine.
     fn mode_reset(&mut self) -> Result<(), Error> {
-        self.switch_mode(JtagState::Reset)
+        self.switch_mode(JtagState::Reset, true)
     }
 
     /// Writes `bits` to IR or DR (chosen by `reg`), ignoring data on TDO.
+    /// Does flushing if `flush` is true.
     ///
     /// Goes to PauseIR or PauseDR afterwards.
-    fn write_bits(&mut self, reg: Register, bits: &BitVec<u8, Lsb0>) -> Result<(), Error>;
+    fn write_bits(
+        &mut self,
+        reg: Register,
+        bits: &BitVec<u8, Lsb0>,
+        flush: bool,
+    ) -> Result<(), Error>;
 
-    /// Reads IR or DR (chosen by `reg`) into `bits`, clocking out ones on TDI.
+    /// (Flushing) Reads IR or DR (chosen by `reg`) into `bits`, clocking out ones on TDI.
     ///
     /// Remains in ShiftIR or ShiftDR afterwards.
     fn read_bits(&mut self, reg: Register, bits: &mut BitVec<u8, Lsb0>) -> Result<(), Error>;
 
-    /// Writes `write_bits` to IR or DR (chosen by `reg`), reads previous data
-    /// into `read_bits`.
+    /// (Flushing) Writes and `write_bits` to IR or DR (chosen by `reg`),
+    /// reads previous data into `read_bits`.
     ///
     /// Read length always equals write length; length of `read_bits` may be
     /// adjusted to match `write_bits`.
@@ -65,7 +98,15 @@ pub trait JtagInterface {
         write_bits: &BitVec<u8, Lsb0>,
     ) -> Result<(), Error>;
 
-    /// Does queued read + write operations for `count` times.
+    /// Does queued read + write operations for `count` times. The counter passed
+    /// to `writer` and `reader` counts in range `0..count`.
+    ///
+    /// Handling of each `writer` call requires knowing the current DR chain length,
+    /// and resizing the data buffer (through `&mut BitVec`) to that length, filling
+    /// it with new data.
+    ///
+    /// When the counter value is `i` in `reader`, it provides DR data captured
+    /// *before* updating DR data with the data produced in `i`th `writer` call.
     #[allow(clippy::type_complexity)]
     fn batch(
         &mut self,
@@ -82,10 +123,10 @@ pub trait JtagInterface {
         let (cnt_blocks, cnt_rem) = (bits / 512, bits % 512);
         for _ in 0..cnt_blocks {
             let data = BitVec::repeat(one_or_zero > 0, 512);
-            self.write_bits(reg, &data)?;
+            self.write_bits(reg, &data, true)?;
         }
         let data = BitVec::repeat(one_or_zero > 0, cnt_rem);
-        self.write_bits(reg, &data)
+        self.write_bits(reg, &data, true)
     }
 
     /// Measures the total IR length of the scan chain, puts all TAPs
@@ -142,186 +183,5 @@ pub trait JtagInterface {
             return Error::result(BrokenChain, "TDO holds 0");
         }
         Ok(dr_len)
-    }
-}
-
-/// Trait for supported cable drivers (currently all of them are from `jtag-taps`).
-pub trait Backend {
-    #[doc(hidden)]
-    fn into_interface(self) -> Result<Box<dyn JtagInterface>, Error>;
-}
-
-impl<T: jtag_taps::cable::Cable + 'static> Backend for T {
-    fn into_interface(self) -> Result<Box<dyn JtagInterface>, Error> {
-        let wrapper = CableWrapper(self);
-        let mut sm: Box<dyn JtagInterface> =
-            Box::new(jtag_taps::statemachine::JtagSM::new(wrapper));
-        sm.mode_reset()?;
-        Ok(sm)
-    }
-}
-
-struct CableWrapper<T: jtag_taps::cable::Cable>(T);
-
-impl<T: jtag_taps::cable::Cable> Deref for CableWrapper<T> {
-    type Target = T;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-impl<T: jtag_taps::cable::Cable> DerefMut for CableWrapper<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-// Implementation notes for `jtag_taps::statemachine::JtagSM`:
-//
-// If some data is written by `write_reg` with `pause_after: false`, the `Cable` implementation
-// will shift the last bit of data and stay in ShiftDR; then it will shift another bit if
-// `change_mode(UpdateDR)` is called right after that. So this is a problematic usage;
-// `pause_after: false` is just for multiple writes, and the last write before changing mode to
-// UpdateDR should have `pause_after: true`, to make the last bit of data shift by the Exit1DR
-// internally. So, `write_bits` and `read_write_bits` sets `pause_after` to true internally.
-//
-// The name `tdo` is used throughout `jtag_taps` cable implementations, referring to the host
-// output line, which is actually the TDI signal of the device.
-
-impl<T, U> JtagInterface for JtagSM<T>
-where
-    T: std::ops::DerefMut<Target = U>,
-    U: Cable + ?Sized,
-{
-    fn switch_mode(&mut self, new_state: JtagState) -> Result<(), Error> {
-        self.change_mode(new_state);
-        self.cable.flush();
-        Ok(())
-    }
-
-    fn write_bits(&mut self, reg: Register, bits: &BitVec<u8, Lsb0>) -> Result<(), Error> {
-        if bits.is_empty() {
-            return Ok(());
-        }
-        let bits = get_aligned(bits);
-        self.write_reg(reg, bits.as_raw_slice(), last_byte_bits(&bits), true);
-        self.cable.flush();
-        Ok(())
-    }
-
-    fn read_bits(&mut self, reg: Register, bits: &mut BitVec<u8, Lsb0>) -> Result<(), Error> {
-        if bits.is_empty() {
-            return Ok(());
-        }
-        let bits_read = self.read_reg(reg, bits.len());
-        bits.force_align();
-        bits.as_raw_mut_slice().copy_from_slice(&bits_read);
-        Ok(())
-    }
-
-    fn read_write_bits(
-        &mut self,
-        reg: Register,
-        read_bits: &mut BitVec<u8, Lsb0>,
-        write_bits: &BitVec<u8, Lsb0>,
-    ) -> Result<(), Error> {
-        if write_bits.is_empty() {
-            return Ok(());
-        }
-        let write_bits = get_aligned(write_bits);
-        let bits_read = self.read_write_reg(
-            reg,
-            write_bits.as_raw_slice(),
-            last_byte_bits(&write_bits),
-            true,
-        );
-        read_bits.resize(write_bits.len(), false);
-        read_bits.force_align();
-        read_bits.as_raw_mut_slice().copy_from_slice(&bits_read);
-        Ok(())
-    }
-
-    fn batch(
-        &mut self,
-        count: usize,
-        writer: &mut dyn FnMut(usize, &mut BitVec<u8, Lsb0>) -> Result<(), Error>,
-        reader: &mut dyn FnMut(usize, &BitVec<u8, Lsb0>) -> Result<(), Error>,
-    ) -> Result<(), Error> {
-        // Do this on error. this cannot be replaced by uses of `Cable::flush`
-        // which is incompatible with the exposed queueing methods.
-        let drain = |sm: &mut Self, queue: &mut VecDeque<(usize, usize)>| {
-            while let Some((_, len)) = queue.pop_front() {
-                let _ = sm.cable.finish_read(len); // discard
-            }
-        };
-
-        let mut writer_buf = BitVec::new();
-        let mut reader_buf = BitVec::new();
-        let mut queue = VecDeque::new();
-        let mut i_write = 0; // index of the next write
-        let mut pending = false; // writer_buf holds a not yet queued transfer
-        while i_write < count || !queue.is_empty() {
-            if i_write < count {
-                if !pending {
-                    writer_buf.clear();
-                    writer_buf.force_align();
-                    if let Err(e) = writer(i_write, &mut writer_buf) {
-                        drain(self, &mut queue);
-                        return Err(e);
-                    }
-                    if writer_buf.is_empty() {
-                        drain(self, &mut queue);
-                        return Err("empty transfer".into());
-                    }
-                    writer_buf.force_align();
-                    pending = true;
-                }
-                if self.queue_read_write(
-                    Data,
-                    writer_buf.as_raw_slice(),
-                    last_byte_bits(&writer_buf),
-                    true,
-                ) {
-                    self.change_mode(JtagState::Idle);
-                    queue.push_back((i_write, writer_buf.len()));
-                    i_write += 1;
-                    pending = false;
-                    continue;
-                } else if queue.is_empty() {
-                    return Err("transfer does not fit into the cable's queue".into());
-                }
-            }
-            while let Some((i, len)) = queue.pop_front() {
-                let res = self.cable.finish_read(len);
-                reader_buf.resize(len, false);
-                reader_buf.force_align();
-                reader_buf.as_raw_mut_slice().copy_from_slice(&res);
-                if let Err(e) = reader(i, &reader_buf) {
-                    drain(self, &mut queue);
-                    return Err(e);
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-fn get_aligned<'a>(bv: &'a BitVec<u8, Lsb0>) -> Cow<'a, BitVec<u8, Lsb0>> {
-    use bitvec::domain::Domain::*;
-    if matches!(bv.domain(), Enclave(_) | Region { head: Some(_), .. }) {
-        let mut bv = bv.to_bitvec();
-        bv.force_align();
-        Cow::Owned(bv)
-    } else {
-        Cow::Borrowed(bv)
-    }
-}
-
-fn last_byte_bits(bv: &BitVec<u8, Lsb0>) -> u8 {
-    if bv.is_empty() {
-        0
-    } else if bv.len().is_multiple_of(8) {
-        8
-    } else {
-        (bv.len() % 8) as u8
     }
 }

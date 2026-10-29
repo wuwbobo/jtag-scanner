@@ -54,13 +54,13 @@ impl PinGroupItem {
 }
 
 impl PinGroup {
-    /// Builds the [PinGroup] with the scanner managed by `Rc` of `RefCell`.
+    /// Creates the [PinGroup] with the scanner managed by `Rc` of `RefCell`.
     /// Multi-thread operation is unsupported.
     ///
     /// **WARNING**: This does not automatically check the added writable pins
     /// against any existing pin group that has the same pin for write access.
     /// This is intended for flexibility; check it manually if needed.
-    pub fn build(
+    pub fn new(
         scanner: &Rc<RefCell<PinScanner>>,
         pins: impl IntoIterator<Item = PinGroupItem>,
     ) -> Result<Self, Error> {
