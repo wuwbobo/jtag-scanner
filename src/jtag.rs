@@ -63,7 +63,7 @@ pub trait JtagInterface {
     /// TDI line is held high while clocking out TMS bits.
     fn switch_mode(&mut self, new_state: JtagState, flush: bool) -> Result<(), Error>;
 
-    /// (Flushing) Resets the state machine.
+    /// (Flushing) Resets the state machine to Test-Logic-Reset.
     fn mode_reset(&mut self) -> Result<(), Error> {
         self.switch_mode(JtagState::Reset, true)
     }

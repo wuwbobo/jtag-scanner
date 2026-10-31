@@ -2,7 +2,7 @@ use bitvec::{order::Lsb0, vec::BitVec};
 
 use crate::{
     AccessMask, Error,
-    ErrorKind::WrongPinType,
+    ErrorKind::{BrokenChain, WrongPinType},
     PinIdIter,
     jtag::{
         JtagInterface, JtagState,
@@ -169,6 +169,7 @@ impl PinScanner {
         self.sm.switch_mode(JtagState::CaptureDR, false)?;
         self.sm
             .read_write_bits(Data, &mut self.dr_in, &self.dr_out)?;
+        self.check_dr_in()?;
         if self.is_extesting() {
             // flush it (which passes through UpdateDR), otherwise it may be
             // executed in the next cycle.
@@ -190,11 +191,13 @@ impl PinScanner {
         // flush and capture DR again after updating DR.
         self.sm
             .read_write_bits(Data, &mut self.dr_in, &self.dr_out)?;
+        self.check_dr_in()?;
         Ok(())
     }
 
     /// Switches all TAPs to BYPASS state.
     pub fn release(&mut self) -> Result<(), Error> {
+        self.sm.mode_reset()?;
         let ir_len: usize = self.tap_infos().iter().map(|t| t.ir_len()).sum();
         self.sm.write_repeated(Instruction, 1, ir_len + 1)?;
         self.sm.switch_mode(JtagState::UpdateIR, true)?;
@@ -202,7 +205,6 @@ impl PinScanner {
         self.tap_cmds = vec![TapCmd::Bypass; self.tap_count()];
         self.dr_in.truncate(self.tap_count());
         self.dr_out.truncate(self.tap_count());
-        self.sm.mode_reset()?;
         Ok(())
     }
 
@@ -222,15 +224,59 @@ impl PinScanner {
             self.dr_out = self.merge_dr_data(&mut splited_dr_out);
         }
         self.tap_cmds[i] = tap_cmd;
-        let mut ir_data = BitVec::new();
-        // `i` is the index starting from TDI, the order of pushing opcodes
-        // needs to be reversed so that it starts from TDO.
-        for (i, &cmd) in self.tap_cmds.iter().enumerate().rev() {
-            self.tap_infos[i].push_opcode(cmd, &mut ir_data);
-        }
-        self.sm.write_bits(Instruction, &ir_data, true)?;
+        let ir_data = {
+            let mut ir_data = BitVec::new();
+            // `i` is the index starting from TDI, the order of pushing opcodes
+            // needs to be reversed so that it starts from TDO.
+            for (i, &cmd) in self.tap_cmds.iter().enumerate().rev() {
+                self.tap_infos[i].push_opcode(cmd, &mut ir_data);
+            }
+            ir_data
+        };
+        let mut ir_readback = BitVec::new();
+        self.sm
+            .read_write_bits(Instruction, &mut ir_readback, &ir_data)?;
         self.sm.switch_mode(JtagState::Idle, true)?;
+        if ir_readback.all() {
+            return Error::result(BrokenChain, "TDO holds 1");
+        } else if ir_readback.not_any() {
+            return Error::result(BrokenChain, "TDO holds 0");
+        }
         self.update()?;
+        Ok(())
+    }
+
+    // Checks the chain if all ones or all zeros are detected in captured DR.
+    fn check_dr_in(&mut self) -> Result<(), Error> {
+        if self.dr_in.all() || self.dr_in.not_any() {
+            let test_pattern = {
+                let mut pattern = BitVec::with_capacity(self.dr_in.len());
+                for _ in 0..self.dr_in.len() / 2 {
+                    pattern.push(true);
+                    pattern.push(false);
+                }
+                if pattern.len() < self.dr_in.len() {
+                    pattern.push(false);
+                }
+                pattern
+            };
+            self.sm.write_bits(Data, &test_pattern, false)?;
+            // No UpdateDR before writing back `dr_out`.
+            let mut readback = BitVec::new();
+            self.sm.read_write_bits(Data, &mut readback, &self.dr_out)?;
+            if readback == test_pattern {
+                return Ok(());
+            } else {
+                let msg = if readback.all() {
+                    "TDO holds 1"
+                } else if readback.not_any() {
+                    "TDO holds 0"
+                } else {
+                    &format!("disturbing, {readback}, expected: {test_pattern}")
+                };
+                return Error::result(BrokenChain, msg);
+            }
+        }
         Ok(())
     }
 

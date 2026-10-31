@@ -90,8 +90,8 @@ impl PinScannerBuilder {
                 tap_infos.push(TapInfo::WithBsdl(Arc::new(
                     bsdl::Entity::parse(path, None).unwrap(),
                 )));
-            } else if let Some((idcode, ir_len)) = bypassed.iter().find(|(i, _)| *i == idcode) {
-                tap_infos.push(TapInfo::AlwaysBypass(*idcode, *ir_len));
+            } else if let Some(&(idcode, ir_len)) = bypassed.iter().find(|(i, _)| *i == idcode) {
+                tap_infos.push(TapInfo::AlwaysBypass { idcode, ir_len });
             } else {
                 return Err(format!("BSDL or BYPASS file of {idcode:08x} not found").into());
             };

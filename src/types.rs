@@ -8,8 +8,8 @@ use crate::Error;
 pub enum TapInfo {
     /// Parsed BSDL information.
     WithBsdl(Arc<bsdl::Entity>),
-    /// IDCODE (`u32`) and IR length (`usize`) for a TAP without known BSDL.
-    AlwaysBypass(u32, usize),
+    /// IDCODE and IR length of a TAP without known BSDL.
+    AlwaysBypass { idcode: u32, ir_len: usize },
 }
 
 impl TapInfo {
@@ -17,7 +17,7 @@ impl TapInfo {
     pub fn ir_len(&self) -> usize {
         match self {
             Self::WithBsdl(entity) => entity.instruction_length(),
-            Self::AlwaysBypass(_, ir_len) => *ir_len,
+            Self::AlwaysBypass { ir_len, .. } => *ir_len,
         }
     }
 
@@ -25,7 +25,7 @@ impl TapInfo {
     pub fn name(&self) -> &str {
         match self {
             Self::WithBsdl(entity) => entity.name().trim(),
-            Self::AlwaysBypass(_, _) => "ALWAYS_BYPASS",
+            Self::AlwaysBypass { .. } => "ALWAYS_BYPASS",
         }
     }
 
@@ -44,7 +44,7 @@ impl TapInfo {
     pub(crate) fn matches_idcode(&self, code: u32) -> bool {
         match self {
             Self::WithBsdl(entity) => jtag_idcode::IDCode::new(code) == entity.idcode_register()[0],
-            Self::AlwaysBypass(idcode, _) => code == *idcode,
+            Self::AlwaysBypass { idcode, .. } => code == *idcode,
         }
     }
 
