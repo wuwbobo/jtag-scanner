@@ -185,9 +185,15 @@ impl PinScanner {
         if !self.is_extesting() {
             return self.update();
         }
-        // apply written bits.
+
+        // apply written bits. NOTE: this writes twice as much data before flushing
+        // compared to `Self::update`, so it is more likely to trigger some bug in
+        // the cable driver, while it is faster than flushing here without such bug.
+        // Such bug needs to be fixed in the driver because a workaround here is not
+        // enough (it may be triggered anyway if the BSR chain is long enough).
         self.sm.write_bits(Data, &self.dr_out, false)?;
         self.sm.switch_mode(JtagState::Idle, false)?;
+
         // flush and capture DR again after updating DR.
         self.sm
             .read_write_bits(Data, &mut self.dr_in, &self.dr_out)?;

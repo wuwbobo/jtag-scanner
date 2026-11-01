@@ -12,6 +12,13 @@ categories = ["embedded", "hardware-support", "development-tools::debugging"]
 keywords = ["embedded", "JTAG", "BSDL"]
 license = "MIT"
 
+[package.metadata.docs.rs]
+features = [
+    "backend-jtag-taps",
+    "protocol",
+    "protocol-spi",
+]
+
 [dependencies]
 bitvec = "1.1.1"
 bsdl = "0.1.1"
@@ -20,7 +27,6 @@ jtag-taps = { version = "0.6.2", optional = true }
 embedded-hal = { version = "1.0.0", optional = true }
 
 [features]
-default = ["protocol", "protocol-spi", "backend-jtag-taps"]
 backend-jtag-taps = [ "dep:jtag-taps" ]
 protocol = [ "dep:embedded-hal" ]
 protocol-spi = ["protocol"]

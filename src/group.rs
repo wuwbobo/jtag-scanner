@@ -3,7 +3,9 @@ use std::{cell::RefCell, rc::Rc};
 use bitvec::{order::Lsb0, vec::BitVec};
 
 use crate::{
-    BsrEdit, BsrView, ChainView, Error, ErrorKind, PinId, PinScanner, PinState, TapCmd, TapInfo,
+    BsrEdit, BsrView, ChainView, Error,
+    ErrorKind::{self, PinGroupLimit},
+    PinId, PinScanner, PinState, TapCmd, TapInfo,
 };
 
 /// Groups pins and assign given names to each pin, restricting the
@@ -85,9 +87,16 @@ impl PinGroup {
         })
     }
 
-    /// Iterates through all [PinId]s in the group, with their given names.
+    /// Iterates through all [PinGroupItem]s in the group, with their given names.
     pub fn pin_ids(&self) -> impl Iterator<Item = &PinGroupItem> {
         self.pins.iter()
+    }
+
+    /// Checks if the pin is writable in this group.
+    pub fn pin_writable(&self, pin_id: &PinId) -> Result<bool, Error> {
+        self.pin_ids()
+            .find_map(|item| (&item.pin_id == pin_id).then_some(item.writable))
+            .ok_or(Error::new(PinGroupLimit, "this pin is not in the group"))
     }
 
     /// Gets a pin identifier by its name given in the group.

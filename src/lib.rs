@@ -9,7 +9,8 @@
 //! ### Building the `PinScanner`
 //! - Check for [compatible debug adapters](jtag_taps::cable), connect the adapter to the target,
 //!   connect the adapter to the PC and power on the target;
-//! - Construct and configure a [Cable](jtag_taps::cable::Cable) instance;
+//! - With the `backend-jtag-taps` feature of `jtag-scanner` enabled, construct and configure a
+//!   [Cable](jtag_taps::cable::Cable) instance;
 //! - Create a [`PinScannerBuilder`] with the `Cable` instance, and (optionally) check the result of
 //!   [get_id_codes](PinScannerBuilder::get_id_codes) to make sure the TAP chain is working;
 //! - With the builder, call [scan_tap_info](PinScannerBuilder::scan_tap_info) with a directory path
@@ -25,8 +26,9 @@
 //! - Check [`PinScanner::batch`] if higher transmission efficiency is required.
 //!
 //! ### Creating bitbang IO interface adapters
-//! Some adapters (e.g. SPI, I2C, NOR and NAND flash) may be added in the future. These adapters should
-//! depend on [`PinGroup`] instead of using [`PinScanner`] directly.
+//! Some adapters (e.g. I2C, NOR and NAND flash) may be added in the future. These adapters should
+//! depend on [`PinGroup`] instead of using [`PinScanner`] directly; they are all under `protocols`
+//! feature gate.
 
 #![deny(unsafe_code)]
 
