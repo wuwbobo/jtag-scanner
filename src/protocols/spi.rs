@@ -1,7 +1,8 @@
 use embedded_hal::spi::{Mode, Phase, Polarity, SpiBus};
 
-use crate::{Error, PinGroup, PinId};
+use crate::{Error, PinGroup, PinId, UpdateMode};
 
+/// Adapter for [SpiBus].
 pub struct Spi {
     pin_group: PinGroup,
     sck: PinId,
@@ -15,7 +16,7 @@ impl Spi {
     /// Creates the adapter for `SpiBus`. Check `embedded-hal-bus` for
     /// how to turn it into an `SpiDevice`.
     ///
-    /// Expects **exclusive** access to `SCK`, `MOSI`, `MISO` in the `pin_group`.
+    /// Expects given pin names `SCK`, `MOSI`, `MISO` in the `pin_group`.
     pub fn new(mut pin_group: PinGroup, mode: Mode) -> Result<Self, Error> {
         let sck = pin_group.get_pin_id("SCK")?;
         let mosi = pin_group.get_pin_id("MOSI")?;
@@ -32,7 +33,7 @@ impl Spi {
         if miso.is_output() && pin_group.pin_writable(&miso)? {
             pin_group.set_pin_state(&miso, None)?;
         }
-        pin_group.write_update()?;
+        pin_group.update(UpdateMode::PostRead)?;
         Ok(Self {
             pin_group,
             sck,
@@ -103,6 +104,7 @@ impl SpiBus for Spi {
         // i: 1, 3..: writes CLK to non-idle(CPHA=0) or idle(CPHA=1), reads `i / 2`th bit from MISO.
         self.pin_group.batch(
             len * 8 * 2,
+            UpdateMode::PostRead,
             |i, edit| {
                 if i % 2 == 0 {
                     let bit_index = i / 2;
@@ -126,7 +128,7 @@ impl SpiBus for Spi {
         )?;
         if !cpha {
             self.pin_group.set_pin_state(&self.sck, Some(cpol))?;
-            self.pin_group.write_update()?;
+            self.pin_group.update(UpdateMode::PostRead)?;
         }
         Ok(())
     }

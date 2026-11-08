@@ -2,8 +2,8 @@ use bitvec::{order::Lsb0, vec::BitVec};
 
 use crate::{
     AccessMask, Error,
-    ErrorKind::{BrokenChain, WrongPinType},
-    PinIdIter,
+    ErrorKind::{self, BrokenChain, WrongPinType},
+    PinIdIter, PinScanSession, UpdateMode,
     jtag::{
         JtagInterface, JtagState,
         Register::{Data, Instruction},
@@ -57,6 +57,20 @@ impl PinScanner {
         ChainView::get_tap_info(self, i)
     }
 
+    /// Iterates through all [PinId]s for a TAP in the chain.
+    /// `i_tap` can be determined by finding in [Self::tap_infos].
+    pub fn pin_ids_for_tap(&self, i_tap: usize) -> Result<PinIdIter, Error> {
+        ChainView::pin_ids_for_tap(self, i_tap)
+    }
+
+    /// Gets a pin identifier by its port name in the BSDL file.
+    /// `i_tap` can be determined by finding in [Self::tap_infos].
+    ///
+    /// For a pin in a bus port, `pin_name` should be "PORT_NAME(i)".
+    pub fn get_pin_id(&self, i_tap: usize, pin_name: &str) -> Result<PinId, Error> {
+        ChainView::get_pin_id(self, i_tap, pin_name)
+    }
+
     /// Current state of a TAP; the index is of [Self::tap_infos].
     pub fn get_tap_state(&self, i: usize) -> Result<TapState, Error> {
         ChainView::get_tap_state(self, i)
@@ -91,7 +105,7 @@ impl PinScanner {
                     self.command(i, TapCmd::Bypass)?;
                     return Err("IDCODE check failed".into());
                 }
-                if !self.tap_cmds.contains(&TapCmd::Extest) {
+                if !self.is_extesting() {
                     // check DR len
                     self.command(i, TapCmd::Sample)?;
                     if self.sm.measure_dr_len()? != self.dr_in.len() {
@@ -112,7 +126,7 @@ impl PinScanner {
                 };
                 splited_dr_out[i].copy_from_bitslice(preload_values);
                 self.dr_out = self.merge_dr_data(&mut splited_dr_out);
-                self.update()?;
+                self.update(UpdateMode::PostWrite)?;
             }
             _ => (),
         }
@@ -124,24 +138,9 @@ impl PinScanner {
         self.tap_cmds.contains(&TapCmd::Extest)
     }
 
-    /// Iterates through all [PinId]s for a TAP in the chain.
-    /// `i_tap` can be determined by finding in [Self::tap_infos].
-    pub fn pin_ids_for_tap(&self, i_tap: usize) -> Result<PinIdIter, Error> {
-        let TapInfo::WithBsdl(bsdl) = self.get_tap_info(i_tap)? else {
-            return Err("not loaded BSDL of this TAP".into());
-        };
-        Ok(PinIdIter::new(i_tap, bsdl))
-    }
-
-    /// Gets a pin identifier by its port name in the BSDL file.
-    /// `i_tap` can be determined by finding in [Self::tap_infos].
-    ///
-    /// For a pin in a bus port, `pin_name` should be "PORT_NAME(i)".
-    pub fn get_pin_id(&self, i_tap: usize, pin_name: &str) -> Result<PinId, Error> {
-        let TapInfo::WithBsdl(bsdl) = self.get_tap_info(i_tap)? else {
-            return Err("not loaded BSDL of this TAP".into());
-        };
-        PinId::from_name(i_tap, bsdl, pin_name)
+    /// Starts the session for performing bitbanging protocol emulations.
+    pub fn enter_session(self) -> Result<PinScanSession, Error> {
+        Ok(PinScanSession::new(self))
     }
 
     /// Gets the pin state at the timepoint before the last [Self::update] call
@@ -150,7 +149,7 @@ impl PinScanner {
         BsrView::new(self, None).get(pin_id)
     }
 
-    /// Sets the new pin state that will be applyed on the next [Self::update] call.
+    /// Sets the new pin state that will be applied on the next [Self::update] call.
     /// Only for setting pins with output cell in EXTEST mode.
     ///
     /// If `new_state` is `Some(state)`, `state` will be set in the output cell,
@@ -163,41 +162,33 @@ impl PinScanner {
     }
 
     /// Applies [Self::set_pin_state] calls since last [Self::update] and refreshes
-    /// the capture buffer for later [Self::get_pin_state] calls with the values
-    /// before setting new pin states.
-    pub fn update(&mut self) -> Result<(), Error> {
-        self.sm.switch_mode(JtagState::CaptureDR, false)?;
-        self.sm
-            .read_write_bits(Data, &mut self.dr_in, &self.dr_out)?;
-        self.check_dr_in()?;
-        if self.is_extesting() {
-            // flush it (which passes through UpdateDR), otherwise it may be
-            // executed in the next cycle.
-            self.sm.switch_mode(JtagState::Idle, true)?;
+    /// the capture buffer for later [Self::get_pin_state] calls, according to the
+    /// [UpdateMode].
+    pub fn update(&mut self, mode: UpdateMode) -> Result<(), Error> {
+        if mode == UpdateMode::PostWrite || !self.is_extesting() {
+            self.sm.switch_mode(JtagState::CaptureDR, false)?;
+            self.sm
+                .read_write_bits(Data, &mut self.dr_in, &self.dr_out)?;
+            self.check_dr_in()?;
+            if self.is_extesting() {
+                // flush it (which passes through UpdateDR), otherwise it may be
+                // executed in the next cycle.
+                self.sm.switch_mode(JtagState::Idle, true)?;
+            }
+        } else {
+            // apply written bits. NOTE: this writes twice as much data before flushing
+            // compared to `Self::update`, so it is more likely to trigger some bug in
+            // the cable driver, while it is faster than flushing here without such bug.
+            // Such bug needs to be fixed in the driver because a workaround here is not
+            // enough (it may be triggered anyway if the BSR chain is long enough).
+            self.sm.write_bits(Data, &self.dr_out, false)?;
+            self.sm.switch_mode(JtagState::Idle, false)?;
+
+            // flush and capture DR again after updating DR.
+            self.sm
+                .read_write_bits(Data, &mut self.dr_in, &self.dr_out)?;
+            self.check_dr_in()?;
         }
-        Ok(())
-    }
-
-    /// Applies [Self::set_pin_state] calls and then does [Self::update], so that
-    /// later [Self::get_pin_state] calls will be influenced by the newly set values.
-    /// This makes no sense if no TAP is in EXTEST mode.
-    pub fn write_update(&mut self) -> Result<(), Error> {
-        if !self.is_extesting() {
-            return self.update();
-        }
-
-        // apply written bits. NOTE: this writes twice as much data before flushing
-        // compared to `Self::update`, so it is more likely to trigger some bug in
-        // the cable driver, while it is faster than flushing here without such bug.
-        // Such bug needs to be fixed in the driver because a workaround here is not
-        // enough (it may be triggered anyway if the BSR chain is long enough).
-        self.sm.write_bits(Data, &self.dr_out, false)?;
-        self.sm.switch_mode(JtagState::Idle, false)?;
-
-        // flush and capture DR again after updating DR.
-        self.sm
-            .read_write_bits(Data, &mut self.dr_in, &self.dr_out)?;
-        self.check_dr_in()?;
         Ok(())
     }
 
@@ -235,7 +226,7 @@ impl PinScanner {
             // `i` is the index starting from TDI, the order of pushing opcodes
             // needs to be reversed so that it starts from TDO.
             for (i, &cmd) in self.tap_cmds.iter().enumerate().rev() {
-                self.tap_infos[i].push_opcode(cmd, &mut ir_data);
+                self.tap_infos[i].push_opcode(cmd, &mut ir_data)?;
             }
             ir_data
         };
@@ -248,7 +239,7 @@ impl PinScanner {
         } else if ir_readback.not_any() {
             return Error::result(BrokenChain, "TDO holds 0");
         }
-        self.update()?;
+        self.update(UpdateMode::PostWrite)?;
         Ok(())
     }
 
@@ -329,8 +320,8 @@ impl PinScanner {
     /// buffer and the cycle counter value; any change to the buffer made by
     /// `writer` will be captured and queued for writing to the device, and
     /// preserved for the next `writer` call. When it is actually executed,
-    /// the captured states before this write is passed to the corresponding
-    /// call to `reader`, along with the same cycle counter value.
+    /// the newly captured states (see [UpdateMode]) is passed to the
+    /// corresponding call to `reader`, along with the same counter value.
     ///
     /// Returns successfully when the last write is finished; before returning,
     /// the output buffer (possibly modified by the last `writer` call) is
@@ -349,6 +340,7 @@ impl PinScanner {
     /// scanner.set_tap_state(i_c6t6, TapState::Extest)?;
     /// scanner.batch(
     ///     65536,
+    ///     UpdateMode::PostWrite,
     ///     |i, edit| {
     ///         // sets value `i` to the 16-bit "bus".
     ///         for (i_pin, pin) in pins.iter().enumerate() {
@@ -379,20 +371,22 @@ impl PinScanner {
     pub fn batch(
         &mut self,
         count: usize,
+        mode: UpdateMode,
         writer: impl FnMut(usize, &mut BsrEdit) -> Result<(), Error>,
         reader: impl FnMut(usize, &BsrView) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        self.batch_with_mask(count, writer, reader, None)
+        self.batch_with_mask(count, mode, writer, reader, None)
     }
 
     pub(crate) fn batch_with_mask(
         &mut self,
         count: usize,
+        mode: UpdateMode,
         mut writer: impl FnMut(usize, &mut BsrEdit) -> Result<(), Error>,
         mut reader: impl FnMut(usize, &BsrView) -> Result<(), Error>,
         access_mask: Option<&AccessMask>,
     ) -> Result<(), Error> {
-        self.write_update()?;
+        self.update(UpdateMode::PostRead)?;
         let mut dr_out = self.dr_out.clone();
         let mut bsr_edit = BsrEdit {
             tap_infos: &self.tap_infos,
@@ -400,15 +394,33 @@ impl PinScanner {
             dr_out: &mut dr_out,
             access_mask,
         };
+        // NOTE: change this when adding read/write only modes.
         let res = self.sm.batch(
-            count,
+            if mode == UpdateMode::PostWrite {
+                count
+            } else {
+                count + 1
+            },
             &mut |i, write_buf| {
+                if i >= count {
+                    // last write under `PostRead` mode, keep last value
+                    return Ok(());
+                }
                 writer(i, &mut bsr_edit)?;
                 write_buf.resize(bsr_edit.dr_out.len(), false);
                 write_buf.copy_from_bitslice(bsr_edit.dr_out);
                 Ok(())
             },
             &mut |i, read_buf| {
+                let i = if mode == UpdateMode::PostWrite {
+                    i
+                } else {
+                    if i == 0 {
+                        return Ok(());
+                    } else {
+                        i - 1
+                    }
+                };
                 let bsr_view = BsrView {
                     tap_infos: &self.tap_infos,
                     tap_cmds: &self.tap_cmds,
@@ -419,7 +431,7 @@ impl PinScanner {
             },
         );
         self.dr_out.copy_from_bitslice(&dr_out);
-        self.update()?;
+        self.update(UpdateMode::PostWrite)?;
         res
     }
 }
@@ -460,11 +472,7 @@ impl<'a, 'm> BsrView<'a, 'm> {
 
     /// Gets the pin state at the timepoint when the BSR is captured.
     pub fn get(&self, pin_id: &PinId) -> Result<PinState, Error> {
-        self.verify_pin_id(pin_id, false)?;
-        let tap_state = self.get_tap_state(pin_id.tap_index())?;
-        if tap_state == TapState::Bypass {
-            return Err("the chip that owns the pin is bypassed".into());
-        }
+        self.check_pin_id(pin_id, false)?;
         let get_val = |cell: Option<usize>| {
             cell.map(|i| self.index_in_dr(pin_id.tap_index(), i))
                 .map(|i| self.dr_in[i])
@@ -496,10 +504,7 @@ impl<'a, 'm> BsrEdit<'a, 'm> {
     /// If `new_state` is `None`, `false` will be set in the output enable cell
     /// if the pin is tristated, otherwise an error is returned.
     pub fn set(&mut self, pin_id: &PinId, new_state: Option<bool>) -> Result<(), Error> {
-        self.verify_pin_id(pin_id, true)?;
-        if self.get_tap_state(pin_id.tap_index())? != TapState::Extest {
-            return Err("the chip that owns the pin is not in EXTEST mode".into());
-        }
+        self.check_pin_id(pin_id, true)?;
         if let Some(new_state) = new_state {
             let Some(i) = pin_id
                 .cell_o()
@@ -552,6 +557,22 @@ pub(crate) trait ChainView {
         Ok(self.tap_infos()[i].clone())
     }
 
+    /// Iterates through all [PinId]s for a TAP in the chain.
+    fn pin_ids_for_tap(&self, i_tap: usize) -> Result<PinIdIter, Error> {
+        let TapInfo::WithBsdl(bsdl) = self.get_tap_info(i_tap)? else {
+            return Error::result(ErrorKind::BsdlUnavailable, "not loaded BSDL of this TAP");
+        };
+        Ok(PinIdIter::new(i_tap, bsdl))
+    }
+
+    /// Gets a pin identifier by its port name in the BSDL file.
+    fn get_pin_id(&self, i_tap: usize, pin_name: &str) -> Result<PinId, Error> {
+        let TapInfo::WithBsdl(bsdl) = self.get_tap_info(i_tap)? else {
+            return Error::result(ErrorKind::BsdlUnavailable, "not loaded BSDL of this TAP");
+        };
+        PinId::from_name(i_tap, bsdl, pin_name)
+    }
+
     /// Current state of a TAP; the index is of [Self::tap_infos].
     fn get_tap_state(&self, i: usize) -> Result<TapState, Error> {
         if i >= self.tap_count() {
@@ -566,10 +587,18 @@ pub(crate) trait ChainView {
     }
 
     /// Checks if a given `PinId` belongs to the current `PinScanner` instance,
-    /// and writing on the pin is allowed.
-    fn verify_pin_id(&self, pin_id: &PinId, for_write: bool) -> Result<(), Error> {
-        if for_write && !pin_id.is_output() {
-            return Error::result(WrongPinType, "not output pin");
+    /// and the TAP state of the chip that has the pin supports the operation;
+    /// if `for_write` is true, also checks whether writing on the pin is allowed.
+    fn check_pin_id(&self, pin_id: &PinId, for_write: bool) -> Result<(), Error> {
+        if for_write {
+            if !pin_id.is_output() {
+                return Error::result(WrongPinType, "not output pin");
+            }
+            if self.get_tap_state(pin_id.tap_index())? != TapState::Extest {
+                return Err("the chip that owns the pin is not in EXTEST mode".into());
+            }
+        } else if self.get_tap_state(pin_id.tap_index())? == TapState::Bypass {
+            return Err("the chip that owns the pin is bypassed".into());
         }
         let tap_info = self.get_tap_info(pin_id.tap_index())?;
         if tap_info.sessioned_tap_id() != pin_id.sessioned_tap_id() {

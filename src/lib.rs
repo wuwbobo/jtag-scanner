@@ -22,7 +22,7 @@
 //!   or iterate through [pin_ids_for_tap](PinScanner::pin_ids_for_tap).
 //! - Set the TAP to `SAMPLE` or `EXTEST` mode by [set_tap_state](PinScanner::set_tap_state).
 //! - Call [get_pin_state](PinScanner::get_pin_state) or [set_pin_state](PinScanner::set_pin_state), and then
-//!   [update](PinScanner::update) or [write_update](PinScanner::write_update).
+//!   [update](PinScanner::update).
 //! - Check [`PinScanner::batch`] if higher transmission efficiency is required.
 //!
 //! ### Creating bitbang IO interface adapters

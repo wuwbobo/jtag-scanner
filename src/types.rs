@@ -1,7 +1,7 @@
 use bitvec::{order::Lsb0, vec::BitVec};
 use std::sync::Arc;
 
-use crate::Error;
+use crate::{Error, ErrorKind};
 
 /// Needed information for each TAP on the chain.
 #[derive(Debug, Clone)]
@@ -50,7 +50,11 @@ impl TapInfo {
 
     /// Converts `cmd` to the IR bit sequence for the `cmd` found in BSDL,
     /// and push them into `buf_ir`. Pushes all ones for `AlwaysBypass`.
-    pub(crate) fn push_opcode(&self, cmd: TapCmd, buf_ir: &mut BitVec<u8, Lsb0>) {
+    pub(crate) fn push_opcode(
+        &self,
+        cmd: TapCmd,
+        buf_ir: &mut BitVec<u8, Lsb0>,
+    ) -> Result<(), Error> {
         let opcode = if let Self::WithBsdl(bsdl) = self {
             match cmd {
                 TapCmd::Bypass => &u64::MAX,
@@ -62,13 +66,16 @@ impl TapInfo {
                     .unwrap_or_else(|| bsdl.opcodes().get("SAMPLE").unwrap()),
                 TapCmd::Extest => bsdl.opcodes().get("EXTEST").unwrap(),
             }
-        } else {
+        } else if cmd == TapCmd::Bypass {
             &u64::MAX
+        } else {
+            return Error::result(ErrorKind::BsdlUnavailable, "cannot leave BYPASS mode");
         };
         for i in 0..self.ir_len() {
             let bit = (opcode >> i) & 1;
             buf_ir.push(bit > 0);
         }
+        Ok(())
     }
 
     /// The safe BSR values to scan in prior to EXTEST.
@@ -290,6 +297,7 @@ pub struct PinState {
     pub(crate) input: Option<bool>,
     pub(crate) output: Option<bool>,
     pub(crate) output_enable: Option<bool>,
+    // XXX: have the EXTEST output value since last update.
 }
 
 impl PinState {
@@ -297,12 +305,44 @@ impl PinState {
     pub fn input(&self) -> Option<bool> {
         self.input
     }
-    /// The intended output value from the internal logic.
+    /// The intended output value from the internal logic, which is the actual
+    /// output value under SAMPLE mode.
     pub fn output(&self) -> Option<bool> {
         self.output
     }
-    /// The intended output enable value from the internal logic.
+    /// The intended output enable value from the internal logic, which is the
+    /// actual output enable value under SAMPLE mode.
     pub fn output_enable(&self) -> Option<bool> {
         self.output_enable
     }
+}
+
+/// Chooses the mode of operating on BSR registers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub enum UpdateMode {
+    /// Applies modified pin output values and refreshes the input values with
+    /// the states before this.
+    ///
+    /// Captures and shifts out BSR values, shifting in new values simultanously;
+    /// after shifting, the BSR is updated under EXTEST mode.
+    ///
+    /// For `batch`, this means the `i`th reader sees the BSR values captured
+    /// before the next UpdateDR applying `i`th write. Duration between `i`th
+    /// read (capture) and `i`th write (update) depends on BSR chain length.
+    PostWrite,
+
+    /// Applies modified pin output values and refreshes the input values with
+    /// the states after this.
+    ///
+    /// Shifts in new values, updates the BSR, and then shift out BSR values
+    /// for reading. Slower than `PostWrite` mode.
+    ///
+    /// It should be the same as `PostWrite` under SAMPLE mode.
+    ///
+    /// For `batch`, this means the `i`th reader sees the BSR values captured
+    /// after the next UpdateDR applying `i`th write. Duration between `i`th
+    /// write (update) and `i`th read (capture) is a short TMS sequence.
+    PostRead,
+    // XXX: add `ReadOnly` and `WriteOnly`.
 }

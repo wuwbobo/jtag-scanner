@@ -1,15 +1,14 @@
 //! Adapters for [embedded_hal::digital]. This is the only protocol module
-//! that is not behind another feature gate; it is also the only protocol
-//! module that does not use [PinGroup](crate::PinGroup).
-
-use std::{cell::RefCell, rc::Rc};
+//! that is not behind another feature gate.
 
 use embedded_hal::digital::{
     OutputPin,
     PinState::{High, Low},
 };
 
-use crate::{Error, ErrorKind::WrongPinType, PinId, PinScanner};
+use crate::{
+    Error, ErrorKind::WrongPinType, PinGroup, PinGroupItem, PinId, PinScanSession, UpdateMode,
+};
 
 impl embedded_hal::digital::Error for Error {
     fn kind(&self) -> embedded_hal::digital::ErrorKind {
@@ -19,20 +18,18 @@ impl embedded_hal::digital::Error for Error {
 
 /// Input-only pin that implements [embedded_hal::digital::InputPin].
 pub struct In {
-    scanner: Rc<RefCell<PinScanner>>,
+    group: PinGroup,
     pin_id: PinId,
 }
 
 impl In {
     /// Creates the adapter.
-    pub fn new(scanner: &Rc<RefCell<PinScanner>>, pin_id: PinId) -> Result<Self, Error> {
+    pub fn new(session: &mut PinScanSession, pin_id: PinId) -> Result<Self, Error> {
         if !pin_id.is_input() {
             return Error::result(WrongPinType, "not input pin");
         }
-        Ok(Self {
-            scanner: scanner.clone(),
-            pin_id,
-        })
+        let group = session.group([PinGroupItem::new("P", pin_id.clone(), false)])?;
+        Ok(Self { group, pin_id })
     }
 }
 
@@ -42,9 +39,8 @@ impl embedded_hal::digital::ErrorType for In {
 
 impl embedded_hal::digital::InputPin for In {
     fn is_high(&mut self) -> Result<bool, Self::Error> {
-        let mut scanner = self.scanner.try_borrow_mut()?;
-        scanner.update()?;
-        scanner
+        self.group.update(UpdateMode::PostWrite)?;
+        self.group
             .get_pin_state(&self.pin_id)
             .map(|st| st.input.unwrap())
     }
@@ -55,20 +51,18 @@ impl embedded_hal::digital::InputPin for In {
 
 /// Output-only pin that implements [embedded_hal::digital::OutputPin].
 pub struct Out {
-    scanner: Rc<RefCell<PinScanner>>,
+    group: PinGroup,
     pin_id: PinId,
 }
 
 impl Out {
     /// Creates the adapter.
-    pub fn new(scanner: &Rc<RefCell<PinScanner>>, pin_id: PinId) -> Result<Self, Error> {
+    pub fn new(session: &mut PinScanSession, pin_id: PinId) -> Result<Self, Error> {
         if !pin_id.is_output() {
             return Error::result(WrongPinType, "not output pin");
         }
-        Ok(Self {
-            scanner: scanner.clone(),
-            pin_id,
-        })
+        let group = session.group([PinGroupItem::new("P", pin_id.clone(), true)])?;
+        Ok(Self { group, pin_id })
     }
 }
 
@@ -84,16 +78,16 @@ impl embedded_hal::digital::OutputPin for Out {
         self.set_state(Low)
     }
     fn set_state(&mut self, state: embedded_hal::digital::PinState) -> Result<(), Self::Error> {
-        let mut scanner = self.scanner.try_borrow_mut()?;
-        scanner.set_pin_state(&self.pin_id, Some(state == High))?;
-        scanner.write_update()
+        self.group
+            .set_pin_state(&self.pin_id, Some(state == High))?;
+        self.group.update(UpdateMode::PostRead)
     }
 }
 
 /// Input and output pin that implements [embedded_hal::digital::InputPin]
 /// and [embedded_hal::digital::OutputPin].
 pub struct InOut {
-    scanner: Rc<RefCell<PinScanner>>,
+    group: PinGroup,
     pin_id: PinId,
 
     // false if the output should keep disabled on the next `set_state` call.
@@ -110,20 +104,18 @@ impl InOut {
     ///   making clear of the initial state. If it is `None`, the output will
     ///   be disabled until [Self::set_output_enable] is called with `true`.
     pub fn new(
-        scanner: &Rc<RefCell<PinScanner>>,
+        session: &mut PinScanSession,
         pin_id: PinId,
         init_val: Option<bool>,
     ) -> Result<Self, Error> {
         if !pin_id.is_input() || !pin_id.is_output() {
             return Error::result(WrongPinType, "not input + output pin");
         }
-
-        let mut sc = scanner.try_borrow_mut()?;
-        sc.set_pin_state(&pin_id, init_val)?;
-        sc.write_update()?;
-
+        let mut group = session.group([PinGroupItem::new("P", pin_id.clone(), true)])?;
+        group.set_pin_state(&pin_id, init_val)?;
+        group.update(UpdateMode::PostRead)?;
         Ok(Self {
-            scanner: scanner.clone(),
+            group,
             pin_id,
             output_enable: init_val.is_some(),
             output_value: init_val,
@@ -153,9 +145,8 @@ impl InOut {
                 self.set_state(if last_output { High } else { Low })?;
             }
         } else {
-            let mut sc = self.scanner.try_borrow_mut()?;
-            sc.set_pin_state(&self.pin_id, None)?;
-            sc.write_update()?;
+            self.group.set_pin_state(&self.pin_id, None)?;
+            self.group.update(UpdateMode::PostRead)?;
             self.output_enable = false;
         }
         Ok(())
@@ -168,9 +159,8 @@ impl embedded_hal::digital::ErrorType for InOut {
 
 impl embedded_hal::digital::InputPin for InOut {
     fn is_high(&mut self) -> Result<bool, Self::Error> {
-        let mut scanner = self.scanner.try_borrow_mut()?;
-        scanner.update()?;
-        scanner
+        self.group.update(UpdateMode::PostWrite)?;
+        self.group
             .get_pin_state(&self.pin_id)
             .map(|st| st.input.unwrap())
     }
@@ -189,9 +179,8 @@ impl embedded_hal::digital::OutputPin for InOut {
     fn set_state(&mut self, state: embedded_hal::digital::PinState) -> Result<(), Self::Error> {
         self.output_value = Some(state == High);
         if self.output_enable {
-            let mut scanner = self.scanner.try_borrow_mut()?;
-            scanner.set_pin_state(&self.pin_id, self.output_value)?;
-            scanner.write_update()?;
+            self.group.set_pin_state(&self.pin_id, self.output_value)?;
+            self.group.update(UpdateMode::PostRead)?;
         }
         Ok(())
     }

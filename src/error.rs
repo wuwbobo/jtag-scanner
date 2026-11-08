@@ -60,10 +60,19 @@ impl std::error::Error for Error {}
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub enum ErrorKind {
+    /// Cannot get IR codes or pin IDs for a TAP without an attached BSDL.
+    BsdlUnavailable,
+    /// Bad JTAG connection.
     BrokenChain,
-    UsageConflict,
+    /// Pin group has been invalidated by an ended session.
+    SessionEnded,
+    /// The pin does not support the operation because of its type.
     WrongPinType,
-    PinGroupLimit,
+    /// Conflicting with an existing group or group item.
+    GroupingConflict,
+    /// Pin operation beyond the limits of the pin group.
+    GroupLimit,
+    /// Other error.
     Other,
 }
 
@@ -89,12 +98,15 @@ impl From<String> for Error {
     }
 }
 
+// `BorrowError` and `BorrowMutError` should not occur in the current crate,
+// but convert them in case of something gets wrong.
+
 impl From<BorrowError> for Error {
     #[track_caller]
     fn from(_: BorrowError) -> Self {
         Error {
-            kind: ErrorKind::UsageConflict,
-            message: "scanner is being used by another pin or pin group".into(),
+            kind: ErrorKind::Other,
+            message: "scanner is being used by another pin group".into(),
             location: Location::caller(),
         }
     }
@@ -104,8 +116,8 @@ impl From<BorrowMutError> for Error {
     #[track_caller]
     fn from(_: BorrowMutError) -> Self {
         Error {
-            kind: ErrorKind::UsageConflict,
-            message: "scanner is being used by another pin or pin group".into(),
+            kind: ErrorKind::Other,
+            message: "scanner is being used by another pin group".into(),
             location: Location::caller(),
         }
     }
