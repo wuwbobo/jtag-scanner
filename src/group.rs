@@ -398,7 +398,7 @@ impl AccessMask {
             }
         }
         if let Some(cell_o) = pin_id.cell_o() {
-            *mask.get_mut(cell_o).unwrap() = true;
+            *mask.get_mut(cell_o).unwrap() = false;
         }
     }
 
