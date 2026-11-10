@@ -7,7 +7,7 @@ use bitvec::{order::Lsb0, vec::BitVec};
 
 use crate::{
     BsrEdit, BsrView, ChainView, Error,
-    ErrorKind::{self, GroupLimit, GroupingConflict},
+    ErrorKind::{self, GroupingConflict},
     PinId, PinIdIter, PinScanner, PinState, TapCmd, TapInfo, TapState, UpdateMode,
 };
 
@@ -28,6 +28,7 @@ pub struct PinScanSession {
 struct PinScanSessionInner {
     scanner: PinScanner,
     usages: Vec<PinUsage>,
+    mask: AccessMask,
 }
 
 #[derive(Debug)]
@@ -45,6 +46,7 @@ impl PinScanSession {
             inner: Rc::new(RefCell::new(PinScanSessionInner {
                 scanner,
                 usages: Vec::new(),
+                mask: AccessMask::new(&tap_infos, true), // allow all
             })),
             tap_infos,
             tap_cmds,
@@ -96,11 +98,27 @@ impl PinScanSession {
     ///
     /// See [PinScanner::set_pin_state] for the meaning of `new_state`.
     pub fn set_pin_state(&mut self, pin_id: &PinId, new_state: Option<bool>) -> Result<(), Error> {
-        let mut inner = self.inner.try_borrow_mut()?;
-        if inner.usages.iter().any(|u| &u.pin_id == pin_id) {
-            return Error::result(ErrorKind::GroupingConflict, "pin used in a group");
-        }
-        inner.scanner.set_pin_state(pin_id, new_state)
+        let inner = &mut *self.inner.try_borrow_mut()?;
+        let mut bsr_edit = BsrEdit::new(&mut inner.scanner, Some(&inner.mask));
+        bsr_edit.set(pin_id, new_state)
+    }
+
+    /// Similar to [PinScanner::batch], with the same limitation for [Self::set_pin_state].
+    pub fn batch(
+        &mut self,
+        count: usize,
+        mode: UpdateMode,
+        mut writer: impl FnMut(usize, &mut BsrEdit) -> Result<(), Error>,
+        mut reader: impl FnMut(usize, &BsrView) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let inner = &mut *self.inner.try_borrow_mut()?;
+        inner.scanner.batch_with_mask(
+            count,
+            mode,
+            |i, edit| writer(i, edit),
+            |i, view| reader(i, view),
+            Some(&inner.mask),
+        )
     }
 
     /// Applies [Self::set_pin_state] calls since last [Self::update] and refreshes
@@ -119,12 +137,18 @@ impl PinScanSession {
         &mut self,
         pins: impl IntoIterator<Item = PinGroupItem>,
     ) -> Result<PinGroup, Error> {
+        // `group` has to be dropped after `inner` is dropped in case of
+        // an error occurred, so its drop glue may call `release_for_item`.
+        let mut group = PinGroup {
+            session: Rc::downgrade(&self.inner),
+            pins: Vec::new(),
+            mask: AccessMask::new(self.tap_infos(), false),
+        };
         let mut inner = self.inner.try_borrow_mut()?;
-        let mut vec_pins = Vec::new();
-        let mut mask = AccessMask::new(inner.scanner.tap_infos());
         for item in pins.into_iter() {
             inner.scanner.check_pin_id(&item.pin_id, item.writable)?;
-            if vec_pins
+            if group
+                .pins
                 .iter()
                 .any(|existing| item.conflicts_with(existing))
             {
@@ -133,18 +157,16 @@ impl PinScanSession {
                     "duplicated pins found in the supposed group",
                 );
             }
-            mask.add_pin(&item.pin_id, item.writable);
             inner.occupy_for_item(&item)?;
-            vec_pins.push(item);
+            group.mask.add_pin(&item.pin_id, item.writable);
+            group.pins.push(item);
         }
-        Ok(PinGroup {
-            session: Rc::downgrade(&self.inner),
-            pins: vec_pins,
-            mask,
-        })
+        Ok(group)
     }
 
     /// Exits the session, invalidating all derived [PinGroup]s.
+    ///
+    /// Panics in a `batch` closure.
     pub fn exit(self) -> PinScanner {
         Rc::into_inner(self.inner).unwrap().into_inner().scanner
     }
@@ -168,6 +190,8 @@ impl PinScanSessionInner {
                 writable: group_item.writable(),
                 count: 1,
             });
+            // disables writing the pin directly with the session.
+            self.mask.remove_pin(&group_item.pin_id, false);
             Ok(())
         }
     }
@@ -178,11 +202,13 @@ impl PinScanSessionInner {
             .extract_if(.., |u| u.pin_id == group_item.pin_id)
             .next();
         if let Some(mut usage) = usage {
-            if usage.writable {
-                assert_eq!(usage.count, 1);
-            } else if usage.count > 1 {
+            if usage.count > 1 {
+                assert!(!usage.writable);
                 usage.count -= 1;
                 self.usages.push(usage);
+            } else {
+                // enables writing the pin directly with the session.
+                self.mask.add_pin(&usage.pin_id, true);
             }
         }
     }
@@ -249,23 +275,21 @@ impl PinGroupItem {
 
 impl PinGroup {
     /// Iterates through all [PinGroupItem]s in the group.
-    pub fn pin_ids(&self) -> impl Iterator<Item = &PinGroupItem> {
+    pub fn pin_items(&self) -> impl Iterator<Item = &PinGroupItem> {
         self.pins.iter()
     }
 
     /// Checks if the pin is writable in this group.
-    pub fn pin_writable(&self, pin_id: &PinId) -> Result<bool, Error> {
-        self.pin_ids()
-            .find_map(|item| (&item.pin_id == pin_id).then_some(item.writable))
-            .ok_or(Error::new(GroupLimit, "this pin is not in the group"))
+    pub fn pin_writable(&self, pin_id: &PinId) -> bool {
+        self.mask.check_access(pin_id, true).is_ok()
     }
 
     /// Gets a pin identifier by its name given in the group.
     pub fn get_pin_id(&self, pin_name: &str) -> Result<PinId, Error> {
         let pin_name = pin_name.trim().to_uppercase();
-        self.pin_ids()
+        self.pin_items()
             .find(|item| item.name == pin_name)
-            .ok_or_else(|| "given name '{pin_name}' not found in group".into())
+            .ok_or_else(|| format!("given name '{pin_name}' not found in group").into())
             .map(|item| item.pin_id().clone())
     }
 
@@ -325,9 +349,11 @@ impl PinGroup {
 impl Drop for PinGroup {
     fn drop(&mut self) {
         if let Ok(session) = self.get_session()
-            && let Ok(mut session) = session.try_borrow_mut()
+            && let Ok(mut session) = session
+                .try_borrow_mut()
+                .inspect_err(|_| eprintln!("pin group failed to release pins on drop"))
         {
-            for item in self.pin_ids() {
+            for item in self.pin_items() {
                 session.release_for_item(item);
             }
         }
@@ -340,10 +366,14 @@ impl Drop for PinGroup {
 pub(crate) struct AccessMask(Vec<BitVec<u8, Lsb0>>);
 
 impl AccessMask {
-    fn new(tap_infos: &[TapInfo]) -> Self {
+    /// If `for_blacklist` is false, all accesses are disabled by default;
+    /// otherwise, all accesses are enabled by default.
+    fn new(tap_infos: &[TapInfo], for_blacklist: bool) -> Self {
         let mut perm_mask = vec![BitVec::new(); tap_infos.len()];
         for (i_tap, mask) in perm_mask.iter_mut().enumerate() {
-            mask.resize(tap_infos[i_tap].dr_len(TapCmd::Extest), false);
+            // currently `AccessMask` is unware of bypassed TAPs,
+            // but this wouldn't cause problem.
+            mask.resize(tap_infos[i_tap].dr_len(TapCmd::Extest), for_blacklist);
         }
         Self(perm_mask)
     }
@@ -357,6 +387,18 @@ impl AccessMask {
             if let Some(cell_o) = pin_id.cell_o() {
                 *mask.get_mut(cell_o).unwrap() = true;
             }
+        }
+    }
+
+    fn remove_pin(&mut self, pin_id: &PinId, remove_for_read: bool) {
+        let mask = &mut self.0[pin_id.tap_index()];
+        if remove_for_read {
+            if let Some(cell_i) = pin_id.cell_i() {
+                *mask.get_mut(cell_i).unwrap() = false;
+            }
+        }
+        if let Some(cell_o) = pin_id.cell_o() {
+            *mask.get_mut(cell_o).unwrap() = true;
         }
     }
 

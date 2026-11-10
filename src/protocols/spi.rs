@@ -22,15 +22,15 @@ impl Spi {
         let mosi = pin_group.get_pin_id("MOSI")?;
         let miso = pin_group.get_pin_id("MISO")?;
         if !sck.is_output()
-            || !pin_group.pin_writable(&sck)?
+            || !pin_group.pin_writable(&sck)
             || !mosi.is_output()
-            || !pin_group.pin_writable(&mosi)?
+            || !pin_group.pin_writable(&mosi)
             || !miso.is_input()
         {
             return Error::result(crate::ErrorKind::WrongPinType, "bad SPI pin config");
         }
         pin_group.set_pin_state(&sck, Some(mode.polarity == Polarity::IdleHigh))?;
-        if miso.is_output() && pin_group.pin_writable(&miso)? {
+        if miso.is_output() && pin_group.pin_writable(&miso) {
             pin_group.set_pin_state(&miso, None)?;
         }
         pin_group.update(UpdateMode::PostRead)?;
